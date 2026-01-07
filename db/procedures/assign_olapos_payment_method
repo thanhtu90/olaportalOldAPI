@@ -1,0 +1,50 @@
+DELIMITER //
+
+CREATE PROCEDURE assign_olapos_payment_method()
+BEGIN
+    DECLARE done INT DEFAULT FALSE;
+    DECLARE terminal_id_var INT;
+    DECLARE current_ts TIMESTAMP;
+    
+    -- Cursor for terminals that exist in both json and terminals tables
+    DECLARE terminal_cursor CURSOR FOR 
+        SELECT t.id
+        FROM terminals t
+        INNER JOIN `json` j ON t.serial = j.serial
+        LEFT JOIN terminal_payment_methods tpm 
+            ON t.id = tpm.terminal_id 
+            AND tpm.payment_method_id = 1
+        WHERE tpm.terminal_id IS NULL
+        GROUP BY t.id;
+    
+    -- Handler for when cursor is complete
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+    
+    -- Get current timestamp for all inserts
+    SET current_ts = NOW();
+    
+    -- Open cursor
+    OPEN terminal_cursor;
+    
+    -- Start the insert loop
+    read_loop: LOOP
+        FETCH terminal_cursor INTO terminal_id_var;
+        
+        IF done THEN
+            LEAVE read_loop;
+        END IF;
+        
+        -- Insert the payment method record
+        INSERT INTO terminal_payment_methods 
+            (terminal_id, payment_method_id, enterdate) 
+        VALUES 
+            (terminal_id_var, 1, current_ts);
+            
+    END LOOP;
+    
+    -- Clean up
+    CLOSE terminal_cursor;
+    
+END //
+
+DELIMITER ;

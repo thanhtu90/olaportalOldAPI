@@ -1,0 +1,464 @@
+<?php
+require_once('vendor/autoload.php');
+include_once "./library/utils.php";
+use QuickBooksOnline\API\DataService\DataService;
+use QuickBooksOnline\API\Core\OAuth\OAuth2\OAuth2AccessToken;
+
+$config = require './config/qb_config.php';
+
+ini_set('max_execution_time', 1800);
+
+header('Content-Type: application/json');
+
+enable_cors();
+
+$pdo = connect_db_and_set_http_method( "GET,POST,DELETE" );
+$tablename = "accounts";
+$msgforinvalidjwt = "No permission";
+$msgforinvalidid = "Invalid request";
+$msgforsqlerror = "System error";
+$msgforemailtaken = "Email taken";
+$msgforsqlsuccess = "Operation completed";
+
+$vendors_id = $_REQUEST["id"];
+$startTime = strtotime($_REQUEST["fromDate"]);
+$endTime = strtotime($_REQUEST["toDate"]) + 86400;
+
+error_log(print_r($vendors_id,true));
+
+error_log(print_r($startTime,true));
+
+error_log(print_r($endTime,true));
+
+function buildAllOrdersJson($pdo, $vendors_id, $startTime,$endTime){
+    $batchArray = [];
+
+    $stmt_orders = $pdo -> prepare("
+        SELECT
+            o.OrderDate,
+            o.uuid,
+            o.orderReference,
+            o.total,
+            oi.id AS item_id,
+            oi.orderUuid AS item_ouuid,
+            oi.taxable AS item_taxable,
+            oi.description AS item_description,
+            oi.price AS item_price,
+            oi.qty AS item_qty,
+            omi.id AS mod_id,
+            omi.items_id AS oi_id,
+            omi.taxable AS mod_taxable,
+            omi.description AS mod_description,
+            omi.price AS mod_price,
+            p.id AS payment_id,
+            p.orderUuid AS payment_ouuid,
+            p.techFee,
+            p.tips
+        FROM orders o
+        LEFT JOIN orderItems oi ON o.uuid = oi.orderUuid
+        LEFT JOIN orderItems omi ON oi.id = omi.items_id
+        LEFT JOIN ordersPayments p ON o.uuid = p.orderUuid
+        WHERE o.lastMod >= :startTime
+        AND o.lastMod < :endTime
+        AND o.vendors_id = :vendors_id
+        ORDER BY o.lastMod DESC, oi.id
+    ");
+    $stmt_orders->execute([
+        ':startTime' => $startTime, 
+        ':endTime' => $endTime, 
+        ':vendors_id' => $vendors_id
+    ]);
+
+    $orderCount = 1;
+
+    $prevOrderUuid = null;
+
+    $prevItemId = null;
+    $itemNameWMod = null;
+    $itemPrice = 0.0;
+
+    $prevPaymentId = null;
+    $techfee = 0.0;
+    $tips = 0.0;
+
+    $items = null;
+    $line = [];
+
+    $batch = null;
+    $batchItemRequest = [];
+    $batchPackage = null;
+
+    $lastOrderRef = null;
+
+    while ( $row = $stmt_orders->fetch() ) {
+        $orderUUID = $row['uuid'];
+        $lastOrderRef = $row['orderReference'];
+
+        error_log("Current Order UUID: " . (string)$orderUUID . "; Prev Order UUID: " . (string)$prevOrderUuid);
+
+        if ($orderUUID === $prevOrderUuid){//Still processing same order, start to add items and payments
+            //add payments
+            $paymentId = $row["payment_id"];
+
+            if ($paymentId !== $prevPaymentId && $paymentId !== null) {//New payment
+                if ($row["payment_ouuid"] === $orderUUID){
+                    if ($row["techFee"] !== null){
+                        $techfee = $techfee + (float)$row["techFee"];
+                    }
+                    if ($row["tips"] !== null){
+                        $tips = $tips + (float)$row["tips"];
+                    }
+                }
+            }
+
+            $prevPaymentId = $paymentId;
+
+            //add items
+            $itemId = $row["item_id"];
+            $taxable = 'NON';
+            if ($itemId === $prevItemId && $itemId !== null){//Still processing same order item, add modifier
+                //Add modifier
+                if ($row['mod_price'] !== null){
+                    $itemPrice = $itemPrice + (float)$row['mod_price'];
+                    $itemNameWMod = $itemNameWMod . "; " . $row['mod_description'];
+                    if ($row['mod_taxable'] === 0){
+                        $taxable = 'NON';
+                    }
+
+                    $items['Description'] = $itemNameWMod;
+                    $items['Amount'] = $itemPrice * (int)$row['item_qty'];
+                    $items['SalesItemLineDetail']['UnitPrice'] = $itemPrice;
+                    $items['SalesItemLineDetail']['TaxCodeRef']['value'] = $taxable;
+                }
+            } else {//Moved to new item
+
+                // save finished items
+                if ($items !== null) {
+                    $line[] = $items;
+                }
+
+                // reset items
+                $items = null;
+
+                // start the new item here
+                $taxable = 'NON';
+                if ($row['item_taxable'] === 1) {
+                   $taxable = 'TAX';
+                }
+                $itemPrice = (float)$row['item_price'];
+                $itemNameWMod = $row['item_description'];
+
+                //Add modifier
+                if ($row['mod_price'] !== null){
+                    $itemPrice = $itemPrice + (float)$row['mod_price'];
+                    $itemNameWMod = $itemNameWMod . "; " . $row['mod_description'];
+                    if ($row['mod_taxable'] === 0){
+                        $taxable = 'NON';
+                    }
+                }
+
+                $items = [
+                    'LineNum' => 1,
+                    'Description' => $itemNameWMod,
+                    'Amount' => $itemPrice  * (int)$row['item_qty'],
+                    'DetailType' => "SalesItemLineDetail",
+                    'SalesItemLineDetail' => [
+                        'UnitPrice' => $itemPrice ,
+                        'Qty' => (int)$row['item_qty'],
+                        'TaxCodeRef' => [
+                            'value' => $taxable
+                        ]
+                    ]
+                ];
+            }
+            //Move on to next item
+            $prevItemId = $itemId;
+        } else {//Moved to new order, reset paramenters
+            if ($prevOrderUuid !== null){
+                // Save last item
+                if ($items !== null) {
+                    $line[] = $items;
+                }
+
+                // Add tips and tech fee as items
+                if ($techfee !== null && $techfee > 0.0) {
+                    $tf_items = [
+                        'LineNum' => 1,
+                        'Description' => 'Tech Fee',
+                        'Amount' => $techfee,
+                        'DetailType' => "SalesItemLineDetail",
+                        'SalesItemLineDetail' => [
+                            'UnitPrice' => $techfee,
+                            'Qty' => 1,
+                            'TaxCodeRef' => [
+                                'value' => 'NON'
+                            ]
+                        ]
+                    ];
+                    $line[] = $tf_items;
+                }
+                if ($tips !== null && $tips > 0.0){
+                    $tips_items = [
+                        'LineNum' => 1,
+                        'Description' => 'Tips',
+                        'Amount' => $tips,
+                        'DetailType' => "SalesItemLineDetail",
+                        'SalesItemLineDetail' => [
+                            'UnitPrice' => $tips,
+                            'Qty' => 1,
+                            'TaxCodeRef' => [
+                                'value' => 'NON'
+                            ]
+                        ]
+                    ];
+                    $line[] = $tips_items;
+                }
+
+                //Save current order
+                error_log("Order Count: " . (string)$orderCount);
+                if ($orderCount <= 30) {
+                    //Create new batch items
+                    //error_log('Line to add to batch: ' . print_r($line,true));
+                    $batch = [
+                        'bId' => "bid" . (string)$orderCount,
+                        'operation' => "create",
+                        'SalesReceipt' => [
+                            'TxnDate' => $orderDate,
+                            'DocNumber' => (string)$row['orderReference'],
+                            'Line' => $line
+                        ]
+                    ];
+                    //Save into current batch item array 
+                    $batchItemRequest[] = $batch;
+                    $orderCount = $orderCount + 1;
+                } else {
+                    //Reset order count
+                    $orderCount = 1;
+                    //Create a sendable batch json
+                    $batchPackage = [
+                        'BatchItemRequest' => $batchItemRequest
+                    ];
+                    error_log('Order Batch Package: ' . print_r(json_encode($batchPackage), true));
+                    //Add batch json into array
+                    $batchArray[] = $batchPackage;
+                    //Reset batch item array
+                    $batchItemRequest = [];
+                    //Add current order (batch item) into the resetted batch item array, prevent skipping the current order
+                    $batch = [
+                        'bId' => "bid" . (string)$orderCount,
+                        'operation' => "create",
+                        'SalesReceipt' => [
+                            'TxnDate' => $orderDate,
+                            'Line' => $line
+                        ]
+                    ];
+                    $batchItemRequest[] = $batch;
+                    $orderCount = $orderCount + 1;
+                }
+            }
+
+            //Reset order
+            $prevOrderUuid = null;
+
+            $line = [];
+            $items = null;
+            $prevItemId = null;
+            $itemNameWMod = null;
+            $itemPrice = 0.0;
+
+            $prevPaymentId = null;
+            $techfee = 0.0;
+            $tips = 0.0;
+
+            // start the new order here
+            $orderDate = date("Y-m-d", $row["OrderDate"]);
+
+            // start new payment here
+            $paymentId = $row["payment_id"];
+            if ($paymentId !== $prevPaymentId && $paymentId !== null) {//New payment
+                if ($row["payment_ouuid"] === $orderUUID){
+                    if ($row["techFee"] !== null){
+                        $techfee = $techfee + (float)$row["techFee"];
+                    }
+                    if ($row["tips"] !== null){
+                        $tips = $tips + (float)$row["tips"];
+                    }
+                }
+            }
+
+            $prevPaymentId = $paymentId;
+
+            // start the new item here
+            if ($row['item_id'] !== null){
+                $itemId = $row["item_id"];
+                $taxable = 'NON';
+                if ($row['item_taxable'] === 1) {
+                   $taxable = 'TAX';
+                }
+                $itemPrice = (float)$row['item_price'];
+                $itemNameWMod = $row['item_description'];
+
+                //Add modifier
+                if ($row['mod_price'] !== null){
+                    $itemPrice = $itemPrice + (float)$row['mod_price'];
+                    $itemNameWMod = $itemNameWMod . "; " . $row['mod_description'];
+                    if ($row['mod_taxable'] === 0){
+                        $taxable = 'NON';
+                    }
+                }
+
+                $items = [
+                    'LineNum' => 1,
+                    'Description' => $itemNameWMod,
+                    'Amount' => $itemPrice  * (int)$row['item_qty'],
+                    'DetailType' => "SalesItemLineDetail",
+                    'SalesItemLineDetail' => [
+                        'UnitPrice' => $itemPrice ,
+                        'Qty' => (int)$row['item_qty'],
+                        'TaxCodeRef' => [
+                            'value' => $taxable
+                        ]
+                    ]
+                ];
+                //Move on to next item
+                $prevItemId = $itemId;
+            }
+        }
+        $prevOrderUuid = $orderUUID;
+    }
+    //Process last item
+    error_log("Last Item: " . print_r($items,true));
+    // save finished items
+    if ($items !== null) {
+        $line[] = $items;
+    }
+    // Add tips and tech fee as items
+    if ($techfee !== null && $techfee > 0.0) {
+        $tf_items = [
+            'LineNum' => 1,
+            'Description' => 'Tech Fee',
+            'Amount' => $techfee,
+            'DetailType' => "SalesItemLineDetail",
+            'SalesItemLineDetail' => [
+                'UnitPrice' => $techfee,
+                'Qty' => 1,
+                'TaxCodeRef' => [
+                    'value' => 'NON'
+                ]
+            ]
+        ];
+        $line[] = $tf_items;
+    }
+    if ($tips !== null && $tips > 0.0){
+        $tips_items = [
+            'LineNum' => 1,
+            'Description' => 'Tips',
+            'Amount' => $tips,
+            'DetailType' => "SalesItemLineDetail",
+            'SalesItemLineDetail' => [
+                'UnitPrice' => $tips,
+                'Qty' => 1,
+                'TaxCodeRef' => [
+                    'value' => 'NON'
+                ]
+            ]
+        ];
+        $line[] = $tips_items;
+    }
+
+    //Save current order
+    error_log("Order Count Last: " . (string)$orderCount);
+    if ($orderCount <= 30) {
+        //Create new batch items
+        if ($lastOrderRef === null || $lastOrderRef === ''){
+            error_log("Empty order reference: " . (string)$orderCount);
+        }
+        $batch = [
+            'bId' => "bid" . (string)$orderCount,
+            'operation' => "create",
+            'SalesReceipt' => [
+                'TxnDate' => $orderDate,
+                'DocNumber' => (string)$lastOrderRef,
+                'Line' => $line
+            ]
+        ];
+        //Save into current batch item array 
+        $batchItemRequest[] = $batch;
+        
+        //Create a sendable batch json
+        $batchPackage = [
+            'BatchItemRequest' => $batchItemRequest
+        ];
+        error_log('Order Batch Package Last: ' . print_r(json_encode($batchPackage), true));
+        //Add batch json into array
+        $batchArray[] = $batchPackage;
+    } else {
+        //Reset order count
+        $orderCount = 1;
+        //Create a sendable batch json
+        $batchPackage = [
+            'BatchItemRequest' => $batchItemRequest
+        ];
+        error_log('Order Batch Package: ' . print_r(json_encode($batchPackage), true));
+        //Add batch json into array
+        $batchArray[] = $batchPackage;
+        //Reset batch item array
+        $batchItemRequest = [];
+        //Add current order (batch item) into the resetted batch item array, prevent skipping the current order
+        $batch = [
+            'bId' => "bid" . (string)$orderCount,
+            'operation' => "create",
+            'SalesReceipt' => [
+                'TxnDate' => $orderDate,
+                'Line' => $line
+            ]
+        ];
+        $batchItemRequest[] = $batch;
+        //Create a sendable batch json
+        $batchPackage = [
+            'BatchItemRequest' => $batchItemRequest
+        ];
+        error_log('Order Batch Package: ' . print_r(json_encode($batchPackage), true));
+        //Add batch json into array
+        $batchArray[] = $batchPackage;
+    }
+
+    return $batchArray;
+}
+
+$payloadArray = buildAllOrdersJson($pdo,$vendors_id,$startTime,$endTime);
+
+$batchCount = count($payloadArray);
+
+error_log('Batch count: ' . print_r($batchCount, true));
+
+foreach ($payloadArray as $payload) {
+    $payload_json = json_encode($payload);
+    $stmt_qb_q = $pdo->prepare("
+        INSERT INTO quickbooks_export_queue (
+        vendor_id,
+        batchCount,
+        payload,
+        status,
+        lastmod
+        ) VALUES (
+        :vendor_id,
+        :batch_count,
+        :payload,
+        :status,
+        CURRENT_TIMESTAMP
+        )
+    ");
+    $stmt_qb_q->execute([
+        ':vendor_id' => (int)$vendors_id,
+        ':batch_count' => (int)$batchCount,
+        ':payload' => $payload_json,
+        ':status' => 1
+    ]);
+}
+
+echo json_encode([
+    'status' => 'success',
+    'batch_count' => count($payloadArray)
+]);
+?>

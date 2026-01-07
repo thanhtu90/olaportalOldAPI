@@ -1,0 +1,124 @@
+<?php
+require_once('vendor/autoload.php');
+include_once "./library/utils.php";
+
+use QuickBooksOnline\API\DataService\DataService;
+
+error_reporting(E_ALL & ~E_DEPRECATED);
+ini_set('display_errors', 1);
+
+// Add socket.io client
+//use ElephantIO\Client;
+
+function processCode()
+{
+    $config = require './config/qb_config.php';
+    $pdo = connect_db_and_set_http_method("GET,POST,DELETE");
+    $stmt = $pdo->prepare(
+        "INSERT INTO quickbooks_token_cred (
+        vendor_id,
+        token_key,
+        token_type,
+        refresh_token,
+        token_expire,
+        f5_token_expire,
+        token_valid_duration,
+        f5_token_valid_duration,
+        realm_id,
+        base_url,
+        lastmod
+        ) VALUES (
+        :vendor_id,
+        :token_key,
+        :token_type,
+        :refresh_token,
+        :token_expire,
+        :f5_token_expire,
+        :token_valid_duration,
+        :f5_token_valid_duration,
+        :realm_id,
+        :base_url,
+        CURRENT_TIMESTAMP
+        )
+        ON DUPLICATE KEY UPDATE
+        token_key = VALUES(token_key),
+        token_type = VALUES(token_type),
+        refresh_token = VALUES(refresh_token),
+        token_expire = VALUES(token_expire),
+        f5_token_expire = VALUES(f5_token_expire),
+        token_valid_duration = VALUES(token_valid_duration),
+        f5_token_valid_duration = VALUES(f5_token_valid_duration),
+        realm_id = VALUES(realm_id),
+        base_url = VALUES(base_url),
+        lastmod = CURRENT_TIMESTAMP"
+    );
+
+    $dataService = DataService::Configure(array(
+        'auth_mode' => 'oauth2',
+        'ClientID' => $config['client_id'],
+        'ClientSecret' =>  $config['client_secret'],
+        'RedirectURI' => $config['oauth_redirect_uri'],
+        'scope' => $config['oauth_scope'],
+        'baseUrl' => "development"
+    ));
+
+    $OAuth2LoginHelper = $dataService->getOAuth2LoginHelper();
+    $parseUrl = parseAuthRedirectUrl(htmlspecialchars_decode($_SERVER['QUERY_STRING']));
+
+    $accessToken = $OAuth2LoginHelper->exchangeAuthorizationCodeForToken($parseUrl['code'], $parseUrl['realmId']);
+
+    $dataService->updateOAuth2Token($accessToken);
+
+    // Use Reflection to access private properties
+    $reflection = new ReflectionClass($accessToken);
+
+    // Extract each property
+    $tokenKey = $reflection->getProperty('accessTokenKey')->getValue($accessToken);
+    $tokenType = $reflection->getProperty('tokenType')->getValue($accessToken);
+    $refreshToken = $reflection->getProperty('refresh_token')->getValue($accessToken);
+    $accessTokenExpiresAt = $reflection->getProperty('accessTokenExpiresAt')->getValue($accessToken);
+    $refreshTokenExpiresAt = $reflection->getProperty('refreshTokenExpiresAt')->getValue($accessToken);
+    $accessTokenValidationPeriod = $reflection->getProperty('accessTokenValidationPeriod')->getValue($accessToken);
+    $refreshTokenValidationPeriod = $reflection->getProperty('refreshTokenValidationPeriod')->getValue($accessToken);
+    $realmID = $reflection->getProperty('realmID')->getValue($accessToken);
+    $baseURL = $reflection->getProperty('baseURL')->getValue($accessToken);
+
+    error_log('Session token set: ' . print_r($accessToken, true));
+
+    $state = $_GET['state'];
+    $decodedState = json_decode(base64_decode($state), true);
+    $id = $decodedState['id'];
+    error_log("Parameter ID: " . $id);
+
+    $stmt->execute([
+        ':vendor_id' => $id,
+        ':token_key' => $tokenKey,
+        ':token_type' => $tokenType,
+        ':refresh_token' => $refreshToken,
+        ':token_expire' => $accessTokenExpiresAt,
+        ':f5_token_expire' => $refreshTokenExpiresAt,
+        ':token_valid_duration' => $accessTokenValidationPeriod,
+        ':f5_token_valid_duration' => $refreshTokenValidationPeriod,
+        ':realm_id' => $realmID,
+        ':base_url' => $baseURL
+    ]);
+
+    /*/ Send WebSocket message
+    $socketUrl = 'http://localhost:8080';
+    $options = ['client' => Client::CLIENT_2X];
+    $client = Client::create($socketUrl, $options);
+    $client->connect();
+    $client->emit('token_status', ['message' => 'Token Acquired']);
+    $client->close();*/
+}
+
+function parseAuthRedirectUrl($url)
+{
+    parse_str($url, $qsArray);
+    return array(
+        'code' => $qsArray['code'],
+        'realmId' => $qsArray['realmId']
+    );
+}
+
+$result = processCode();

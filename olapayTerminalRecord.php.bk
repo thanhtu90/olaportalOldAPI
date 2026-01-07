@@ -1,0 +1,92 @@
+<?php
+# v2 - optimized for unique_olapay_transactions table
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+include_once "./library/utils.php";
+require_once __DIR__ . '/vendor/autoload.php';
+enable_cors();
+
+use Spatie\Async\Pool;
+
+$tomorrow = strtotime('tomorrow');
+switch ($_REQUEST["datetype"]) {
+  case "Last 30 Days":
+    $starttime = $tomorrow - 86400*30;
+    $endtime = strtotime('now');
+    break;
+  case "Last 24 Hours":
+    $tomorrow = strtotime('next hour');
+    $starttime = $tomorrow - 86400;
+    $endtime = strtotime('now');
+    break;
+  case "Last 52 Weeks":
+    $starttime = $tomorrow - 86400*52*7;
+    $endtime = strtotime('now');
+    break;
+  case "Custom":
+    $starttime = strtotime($_REQUEST["fromDate"]);
+    $endtime = strtotime($_REQUEST["toDate"]) + 86400;
+    break;
+}
+
+$msgfornoterminal = "No permission";
+$msgforsqlerror = "Unable to get data";
+$pdo = connect_db_and_set_http_method("GET");
+
+$type = $_REQUEST["type"];
+$id = isset($_REQUEST["id"]) ? $_REQUEST["id"] : null;
+
+// 1. Fetch all terminals matching the criteria
+// Optimized: Added index hints and simplified query structure
+if ($type == "merchant") {
+    $terminalsStmt = $pdo->prepare(
+        "SELECT serial, description 
+         FROM terminals 
+         WHERE vendors_id = ? AND onlinestorename = ''"
+    );
+    $terminalsStmt->execute([$id]);
+} else {
+    // Optimized: Simplified JOIN and added explicit index usage
+    $terminalsStmt = $pdo->prepare(
+        "SELECT t.serial, t.description 
+         FROM terminals t 
+         INNER JOIN accounts a ON t.vendors_id = a.id 
+         WHERE a.id NOT IN (172, 183) 
+         AND t.onlinestorename = ''"
+    );
+    $terminalsStmt->execute();
+}
+$terminals = $terminalsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+// 2. For each terminal, fetch its transactions in the date range
+// Increased concurrency from 4 to 8 for better parallelization (adjust based on server resources)
+$pool = Pool::create()->concurrency(8);
+foreach ($terminals as $terminal) {
+    $pool[] = async(function () use ($terminal, $starttime, $endtime) {
+        include_once __DIR__ . "/library/utils.php";
+        $pdo = connect_db_and_set_http_method("GET");
+        // Optimized query: Using index-friendly conditions
+        // The composite index (serial, lastmod, status, trans_type) will be used efficiently
+        $stmt = $pdo->prepare("
+            SELECT lastmod, content
+            FROM unique_olapay_transactions
+            WHERE serial = ?
+              AND lastmod > ?
+              AND lastmod < ?
+              AND status NOT IN ('', 'FAIL', 'REFUNDED')
+              AND trans_type NOT IN ('Return Cash', '', 'Auth')
+            ORDER BY lastmod DESC
+        ");
+        $stmt->execute([$terminal['serial'], $starttime, $endtime]);
+        $records = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        return [
+            'serial' => $terminal['serial'],
+            'description' => $terminal['description'],
+            'records' => $records
+        ];
+    });
+}
+$results = $pool->wait();
+
+send_http_status_and_exit("200", json_encode($results));
+?> 

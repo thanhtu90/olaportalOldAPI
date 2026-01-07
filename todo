@@ -1,0 +1,2 @@
+get lastmod olapay
+send serial number + start timestamp -> send back all olapayjson from that timestamp

@@ -1,0 +1,424 @@
+<?php
+require_once __DIR__ . '/vendor/autoload.php';
+
+use Dotenv\Dotenv;
+
+$dotenv = Dotenv::createImmutable(__DIR__);
+$dotenv->load();
+
+include_once __DIR__ . '/config/database.php';
+
+/**
+ * Calculate tech_fee_rate from JSON item data if payment was by card
+ * 
+ * @param object $item_json_item The item JSON object containing both "item" and "orderItem"
+ * @param array $payments_json Payments JSON array to check payment method
+ * @param string $orderReference Order reference to match payment
+ * @return float Calculated tech_fee_rate or default_tech_fee_rate if not applicable
+ */
+function calculateTechFeeRate($item_json_item, $payments_json, $orderReference) {
+    $default_tech_fee_rate = 0.0000;
+    
+    // Check if payment was by card (not CASH)
+    $isCardPayment = false;
+    for ($p = 0; $p < count($payments_json); $p++) {
+        $payment_orderRef = isset($payments_json[$p]->{"orderReference"}) ? strval($payments_json[$p]->{"orderReference"}) : null;
+        if ($payment_orderRef === strval($orderReference)) {
+            $refNumber = isset($payments_json[$p]->{"refNumber"}) ? $payments_json[$p]->{"refNumber"} : null;
+            // Check if payment was by card (not CASH)
+            if ($refNumber !== null && strtoupper(trim($refNumber)) !== "CASH") {
+                $isCardPayment = true;
+                break;
+            }
+        }
+    }
+    
+    if (!$isCardPayment) {
+        return $default_tech_fee_rate;
+    }
+    
+    // Get orderItem data
+    if (!isset($item_json_item->{"orderItem"})) {
+        return $default_tech_fee_rate;
+    }
+    
+    $orderItem = $item_json_item->{"orderItem"};
+    $orderItem_iUUID = isset($orderItem->{"iUUID"}) ? $orderItem->{"iUUID"} : null;
+    $orderItem_price = isset($orderItem->{"price"}) ? floatval($orderItem->{"price"}) : 0;
+    
+    if (empty($orderItem_iUUID) || $orderItem_price <= 0) {
+        return $default_tech_fee_rate;
+    }
+    
+    // Get base item price from the same JSON element
+    if (!isset($item_json_item->{"item"})) {
+        return $default_tech_fee_rate;
+    }
+    
+    $item = $item_json_item->{"item"};
+    $item_iUUID = isset($item->{"iUUID"}) ? $item->{"iUUID"} : null;
+    $item_price = isset($item->{"price"}) ? floatval($item->{"price"}) : 0;
+    
+    // Verify iUUID matches
+    if ($item_iUUID !== $orderItem_iUUID || $item_price <= 0) {
+        return $default_tech_fee_rate;
+    }
+    
+    // Calculate tech_fee_rate if orderItem price > item price
+    if ($orderItem_price > $item_price) {
+        $tech_fee_rate = $orderItem_price / $item_price;
+        
+        // Ensure tech_fee_rate is within decimal(5,4) range (max 9.9999)
+        if ($tech_fee_rate > 9.9999) {
+            $tech_fee_rate = 9.9999;
+        }
+        
+        return $tech_fee_rate;
+    }
+    
+    return $default_tech_fee_rate;
+}
+
+// Connect to database
+try {
+    $databaseService = new DatabaseService();
+    $pdo = $databaseService->getConnection();
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+    
+    // Optimize database settings for bulk operations
+    try {
+        $pdo->exec("SET SESSION sql_mode = 'NO_AUTO_VALUE_ON_ZERO'");
+        $pdo->exec("SET SESSION autocommit = 1");
+        $pdo->exec("SET SESSION wait_timeout = 28800"); // 8 hours
+        $pdo->exec("SET SESSION interactive_timeout = 28800"); // 8 hours
+        $pdo->exec("SET SESSION net_write_timeout = 600"); // 10 minutes
+        $pdo->exec("SET SESSION net_read_timeout = 600"); // 10 minutes
+        
+        echo "Database optimized for bulk operations.\n";
+    } catch (PDOException $opt_e) {
+        echo "Note: Some database optimizations may not be available: " . $opt_e->getMessage() . "\n";
+        echo "Continuing with default settings...\n";
+    }
+} catch (PDOException $e) {
+    error_log("Database connection failed: " . $e->getMessage());
+    die("Database connection failed: " . $e->getMessage() . "\n");
+}
+
+// Parse CLI parameters
+$from_date = null;
+$to_date = null;
+if (php_sapi_name() === 'cli') {
+    $options = getopt("", ["from-date:", "to-date:"]);
+    $from_date = $options['from-date'] ?? null;
+    $to_date = $options['to-date'] ?? null;
+}
+
+// Convert dates to Unix timestamps
+$from_timestamp = null;
+$to_timestamp = null;
+if ($from_date) {
+    if (!preg_match("/^\d{4}-\d{2}-\d{2}$/", $from_date)) {
+        die("Error: from-date must be in YYYY-MM-DD format.\n");
+    }
+    $from_timestamp = strtotime($from_date . " 00:00:00");
+    if ($from_timestamp === false) {
+        die("Error: Invalid from-date format.\n");
+    }
+}
+
+if ($to_date) {
+    if (!preg_match("/^\d{4}-\d{2}-\d{2}$/", $to_date)) {
+        die("Error: to-date must be in YYYY-MM-DD format.\n");
+    }
+    $to_timestamp = strtotime($to_date . " 23:59:59");
+    if ($to_timestamp === false) {
+        die("Error: Invalid to-date format.\n");
+    }
+}
+
+if ($from_timestamp && $to_timestamp && $from_timestamp > $to_timestamp) {
+    die("Error: from-date must be before or equal to to-date.\n");
+}
+
+echo "Starting sync of tech_fee_rate for old order items...\n";
+if ($from_timestamp) {
+    echo "Date filter: from " . date('Y-m-d H:i:s', $from_timestamp);
+    if ($to_timestamp) {
+        echo " to " . date('Y-m-d H:i:s', $to_timestamp);
+    }
+    echo "\n";
+}
+
+// Build query with optional date filters
+$query = "
+    SELECT DISTINCT 
+        op.id as payment_id,
+        op.orderUuid,
+        op.orderReference,
+        op.refNumber,
+        op.terminals_id,
+        op.lastMod as payment_lastMod,
+        o.lastMod as order_lastMod,
+        t.serial as terminal_serial
+    FROM ordersPayments op
+    INNER JOIN terminals t ON op.terminals_id = t.id
+    INNER JOIN orders o ON op.orderUuid = o.uuid
+    WHERE UPPER(TRIM(op.refNumber)) != 'CASH'
+    AND op.orderUuid IS NOT NULL
+    AND op.orderUuid != ''
+";
+
+$params = [];
+
+if ($from_timestamp !== null) {
+    $query .= " AND o.lastMod >= ?";
+    $params[] = $from_timestamp;
+}
+
+if ($to_timestamp !== null) {
+    $query .= " AND o.lastMod <= ?";
+    $params[] = $to_timestamp;
+}
+
+$query .= " ORDER BY op.id";
+
+$stmt = $pdo->prepare($query);
+$stmt->execute($params);
+$payments = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+$total_payments = count($payments);
+echo "Found $total_payments card payments to process\n";
+
+$processed_count = 0;
+$updated_count = 0;
+$skipped_count = 0;
+$error_count = 0;
+
+foreach ($payments as $payment) {
+    $payment_id = $payment['payment_id'];
+    $orderUuid = $payment['orderUuid'];
+    $orderReference = $payment['orderReference'];
+    $terminal_serial = $payment['terminal_serial'];
+    $payment_lastMod = $payment['payment_lastMod'];
+    $order_lastMod = $payment['order_lastMod'];
+    
+    $processed_count++;
+    
+    echo "\n[{$processed_count}/{$total_payments}] Processing payment ID: {$payment_id}, orderUuid: {$orderUuid}\n";
+    
+    try {
+        // Get the order to find orderReference
+        $order_stmt = $pdo->prepare("SELECT id, orderReference FROM orders WHERE uuid = ? LIMIT 1");
+        $order_stmt->execute([$orderUuid]);
+        $order = $order_stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$order) {
+            echo "  -> Order not found for orderUuid: {$orderUuid}, skipping...\n";
+            $skipped_count++;
+            continue;
+        }
+        
+        $orders_id = $order['id'];
+        $orderRef = $order['orderReference'];
+        
+        // Use the earlier of payment_lastMod or order_lastMod to find JSON
+        // Convert Unix timestamp to MySQL datetime format
+        // Add a time range: 1 hour before and 2 hours after to account for timing differences
+        $base_timestamp = min($payment_lastMod, $order_lastMod);
+        $from_datetime = date('Y-m-d H:i:s', $base_timestamp - 3600); // 1 hour before
+        $to_datetime = date('Y-m-d H:i:s', $base_timestamp + 7200);   // 2 hours after
+        
+        // Apply date filters from CLI parameters if provided
+        if ($from_timestamp !== null) {
+            $cli_from_datetime = date('Y-m-d H:i:s', $from_timestamp);
+            // Use the later of the two (more restrictive)
+            if ($cli_from_datetime > $from_datetime) {
+                $from_datetime = $cli_from_datetime;
+            }
+        }
+        
+        if ($to_timestamp !== null) {
+            $cli_to_datetime = date('Y-m-d H:i:s', $to_timestamp);
+            // Use the earlier of the two (more restrictive)
+            if ($cli_to_datetime < $to_datetime) {
+                $to_datetime = $cli_to_datetime;
+            }
+        }
+        
+        // Find the latest JSON entry for this terminal serial that contains this orderUuid
+        // and has lastmod within the time range
+        $json_stmt = $pdo->prepare("
+            SELECT id, content, lastmod
+            FROM json
+            WHERE serial = ?
+            AND (content LIKE ?)
+            AND lastmod >= ?
+            AND lastmod <= ?
+            ORDER BY lastmod DESC, id DESC
+            LIMIT 1
+        ");
+        
+        $json_stmt->execute([
+            $terminal_serial, 
+            "%$orderUuid%",
+            $from_datetime,
+            $to_datetime
+        ]);
+        $json_row = $json_stmt->fetch(PDO::FETCH_ASSOC);
+        
+        // If no JSON found within time range, try without time filter as fallback (but still apply CLI date filters if provided)
+        if (!$json_row) {
+            echo "  -> JSON not found within time range (lastMod: {$base_timestamp}), trying with CLI date filter only...\n";
+            
+            $fallback_query = "
+                SELECT id, content, lastmod
+                FROM json
+                WHERE serial = ?
+                AND (content LIKE ?)
+            ";
+            
+            $fallback_params = [
+                $terminal_serial, 
+                "%$orderUuid%"
+            ];
+            
+            // Apply CLI date filters if provided
+            if ($from_timestamp !== null) {
+                $fallback_query .= " AND lastmod >= ?";
+                $fallback_params[] = date('Y-m-d H:i:s', $from_timestamp);
+            }
+            
+            if ($to_timestamp !== null) {
+                $fallback_query .= " AND lastmod <= ?";
+                $fallback_params[] = date('Y-m-d H:i:s', $to_timestamp);
+            }
+            
+            $fallback_query .= " ORDER BY lastmod DESC, id DESC LIMIT 1";
+            
+            $json_fallback_stmt = $pdo->prepare($fallback_query);
+            $json_fallback_stmt->execute($fallback_params);
+            $json_row = $json_fallback_stmt->fetch(PDO::FETCH_ASSOC);
+        }
+        
+        if (!$json_row) {
+            echo "  -> JSON not found for serial: {$terminal_serial}, orderUuid: {$orderUuid}, skipping...\n";
+            $skipped_count++;
+            continue;
+        }
+        
+        // Parse JSON content
+        $json_content = str_replace('&quot;', '"', $json_row['content']);
+        $decoded_content = json_decode($json_content);
+        
+        if (!$decoded_content) {
+            echo "  -> Failed to decode JSON (ID: {$json_row['id']}), skipping...\n";
+            $skipped_count++;
+            continue;
+        }
+        
+        // Get items and payments from JSON
+        $items_json = json_decode($decoded_content->{"items"} ?? "[]") ?? [];
+        $payments_json = json_decode($decoded_content->{"payments"} ?? "[]") ?? [];
+        
+        if (empty($items_json)) {
+            echo "  -> No items found in JSON, skipping...\n";
+            $skipped_count++;
+            continue;
+        }
+        
+        // Get all order items for this order
+        $order_items_stmt = $pdo->prepare("
+            SELECT id, itemUuid, price, tech_fee_rate
+            FROM orderItems
+            WHERE orders_id = ?
+            AND itemUuid IS NOT NULL
+        ");
+        $order_items_stmt->execute([$orders_id]);
+        $order_items = $order_items_stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        if (empty($order_items)) {
+            echo "  -> No order items found for order ID: {$orders_id}, skipping...\n";
+            $skipped_count++;
+            continue;
+        }
+        
+        echo "  -> Found " . count($order_items) . " order items to process\n";
+        
+        $items_updated = 0;
+        
+        // Process each order item
+        foreach ($order_items as $order_item) {
+            $order_item_id = $order_item['id'];
+            $item_uuid = $order_item['itemUuid'];
+            $current_tech_fee_rate = $order_item['tech_fee_rate'];
+            
+            // Find matching item in JSON
+            // Match by iUUID and either orderReference or orderUuid
+            $matched_item = null;
+            for ($j = 0; $j < count($items_json); $j++) {
+                if (!isset($items_json[$j]->{"orderItem"})) {
+                    continue;
+                }
+                
+                $orderItem = $items_json[$j]->{"orderItem"};
+                $orderItem_iUUID = isset($orderItem->{"iUUID"}) ? $orderItem->{"iUUID"} : null;
+                
+                // Must match iUUID
+                if ($orderItem_iUUID !== $item_uuid) {
+                    continue;
+                }
+                
+                // Match by orderReference or orderUuid
+                $itemOrderRef = isset($orderItem->{"orderReference"}) 
+                    ? strval($orderItem->{"orderReference"}) 
+                    : null;
+                $itemOrderUuid = isset($orderItem->{"oUUID"}) 
+                    ? $orderItem->{"oUUID"} 
+                    : (isset($orderItem->{"orderUuid"}) ? $orderItem->{"orderUuid"} : null);
+                
+                // Check if this item matches the orderReference or orderUuid
+                if (($itemOrderRef !== null && $itemOrderRef === strval($orderRef)) || 
+                    ($itemOrderUuid !== null && $itemOrderUuid === $orderUuid)) {
+                    $matched_item = $items_json[$j];
+                    break;
+                }
+            }
+            
+            if (!$matched_item) {
+                continue;
+            }
+            
+            // Calculate tech_fee_rate
+            $tech_fee_rate = calculateTechFeeRate($matched_item, $payments_json, $orderRef);
+            
+            // Only update if tech_fee_rate is different from current value
+            if ($tech_fee_rate != $current_tech_fee_rate) {
+                $update_stmt = $pdo->prepare("UPDATE orderItems SET tech_fee_rate = ? WHERE id = ?");
+                $update_stmt->execute([$tech_fee_rate, $order_item_id]);
+                
+                echo "    -> Updated order item ID: {$order_item_id} (iUUID: {$item_uuid}) - tech_fee_rate: {$current_tech_fee_rate} -> {$tech_fee_rate}\n";
+                $items_updated++;
+            }
+        }
+        
+        if ($items_updated > 0) {
+            $updated_count++;
+            echo "  -> Updated {$items_updated} order items for order ID: {$orders_id}\n";
+        } else {
+            echo "  -> No updates needed for order ID: {$orders_id}\n";
+        }
+        
+    } catch (Exception $e) {
+        echo "  -> ERROR processing payment ID: {$payment_id} - " . $e->getMessage() . "\n";
+        $error_count++;
+    }
+}
+
+echo "\n=== Summary ===\n";
+echo "Total payments processed: {$processed_count}\n";
+echo "Orders with items updated: {$updated_count}\n";
+echo "Payments skipped: {$skipped_count}\n";
+echo "Errors: {$error_count}\n";
+echo "Sync completed!\n";
+

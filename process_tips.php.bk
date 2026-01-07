@@ -1,0 +1,208 @@
+<?php
+
+ini_set("display_errors", 1);
+include_once "./library/utils.php";
+
+$pdo = connect_db_and_set_http_method("GET");
+if (!$pdo) {
+    error_log("Database connection failed in process_tips.php");
+    header('Content-Type: application/json');
+    http_response_code(500);
+    echo json_encode(['success' => false, 'error' => 'Database connection failed']);
+    exit;
+}
+
+function processJsonTips($jsonStartId) {
+    global $pdo;
+    
+    error_log("Starting processJsonTips with jsonStartId: " . $jsonStartId);
+    
+    if (!$pdo) {
+        throw new Exception("Database connection failed");
+    }
+
+    // Initialize tracking arrays
+    $successUpdates = [];
+    $failedUpdates = [];
+
+    // Query raw transactions with tips using raw query
+    $query = "SELECT * FROM `json` WHERE id <= ? AND (";
+    $query .= " content LIKE ? OR";
+    $query .= " content LIKE ? OR";
+    $query .= " content LIKE ? OR";
+    $query .= " content LIKE ? OR";
+    $query .= " content LIKE ? OR";
+    $query .= " content LIKE ? OR";
+    $query .= " content LIKE ? OR";
+    $query .= " content LIKE ? OR";
+    $query .= " content LIKE ?";
+    $query .= ") LIMIT 200";
+
+    error_log("Executing prepared query: " . $query);
+    
+    $stmt = $pdo->prepare($query);
+    if (!$stmt) {
+        error_log("Failed to prepare query: " . json_encode($pdo->errorInfo()));
+        throw new Exception("Failed to prepare query: " . $pdo->errorInfo()[2]);
+    }
+
+    $params = [
+        $jsonStartId,
+        '%tips\\\":1%',
+        '%tips\\\":2%',
+        '%tips\\\":3%',
+        '%tips\\\":4%',
+        '%tips\\\":5%',
+        '%tips\\\":6%',
+        '%tips\\\":7%',
+        '%tips\\\":8%',
+        '%tips\\\":9%'
+    ];
+    
+    $result = $stmt->execute($params);
+    if (!$result) {
+        error_log("Query failed: " . json_encode($pdo->errorInfo()));
+        throw new Exception("Failed to execute query: " . $pdo->errorInfo()[2]);
+    }
+
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    error_log("Query returned " . count($rows) . " rows");
+    if (count($rows) > 0) {
+        error_log("First row content sample: " . substr($rows[0]['content'], 0, 100));
+    }
+    
+    $newJsonStartId = $jsonStartId;
+    
+    foreach ($rows as $row) {
+        error_log("Processing row ID: " . $row['id']);
+        $content = json_decode($row['content'], true);
+        error_log("JSON content: " . substr($row['content'], 0, 500)); // Log first 500 chars of content
+        
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            error_log("JSON decode error: " . json_last_error_msg());
+            continue;
+        }
+        
+        $newJsonStartId = min($newJsonStartId, $row['id']);
+        
+        // Process each payment in the content
+        if (isset($content['payments'])) {
+            // The payments are stored as a JSON string, need to decode again
+            $payments = json_decode($content['payments'], true);
+            error_log("Decoded payments: " . json_encode($payments));
+            
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                error_log("JSON decode error for payments: " . json_last_error_msg());
+                continue;
+            }
+            
+            if (is_array($payments)) {
+                error_log("Found " . count($payments) . " payments to process");
+                foreach ($payments as $payment) {
+                    error_log("Processing payment: " . json_encode($payment));
+                    if (isset($payment['tips']) && $payment['tips'] > 0 && isset($payment['oUUID'])) {
+                        error_log("Found valid tip: " . $payment['tips'] . " for order: " . $payment['oUUID']);
+                        try {
+                            // First get the current tip value
+                            $selectQuery = "SELECT tip FROM `orders` WHERE uuid = ?";
+                            $selectStmt = $pdo->prepare($selectQuery);
+                            if (!$selectStmt) {
+                                error_log("Failed to prepare select statement: " . $pdo->errorInfo()[2]);
+                                throw new Exception($pdo->errorInfo()[2]);
+                            }
+                            
+                            $selectStmt->execute([$payment['oUUID']]);
+                            $oldTip = null;
+                            
+                            if ($oldRow = $selectStmt->fetch(PDO::FETCH_ASSOC)) {
+                                $oldTip = $oldRow['tip'];
+                                error_log("Found existing tip: " . $oldTip . " for order: " . $payment['oUUID']);
+                            } else {
+                                error_log("No existing order found for UUID: " . $payment['oUUID']);
+                            }
+
+                            // Update the order table with the tip amount
+                            $updateQuery = "UPDATE `orders` SET tip = ? WHERE uuid = ?";
+                            $updateStmt = $pdo->prepare($updateQuery);
+                            if (!$updateStmt) {
+                                error_log("Failed to prepare update statement: " . $pdo->errorInfo()[2]);
+                                throw new Exception($pdo->errorInfo()[2]);
+                            }
+                            
+                            $updateStmt->execute([$payment['tips'], $payment['oUUID']]);
+                            
+                            if ($updateStmt->rowCount() > 0) {
+                                error_log("Successfully updated tip for order: " . $payment['oUUID']);
+                                $successUpdates[] = [
+                                    'oUUID' => $payment['oUUID'],
+                                    'oldTip' => $oldTip,
+                                    'newTip' => $payment['tips'],
+                                    'jsonId' => $row['id']
+                                ];
+                            } else {
+                                error_log("Failed to update tip for order: " . $payment['oUUID'] . " - Order not found");
+                                $failedUpdates[] = [
+                                    'oUUID' => $payment['oUUID'],
+                                    'tips' => $payment['tips'],
+                                    'jsonId' => $row['id'],
+                                    'reason' => 'Order not found'
+                                ];
+                            }
+                        } catch (Exception $e) {
+                            error_log("Error processing tip for order: " . $payment['oUUID'] . " - " . $e->getMessage());
+                            $failedUpdates[] = [
+                                'oUUID' => $payment['oUUID'],
+                                'tips' => $payment['tips'],
+                                'jsonId' => $row['id'],
+                                'reason' => $e->getMessage()
+                            ];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    error_log("Finished processing tips");
+    
+    return [
+        'newJsonStartId' => $newJsonStartId + 1,
+        'successUpdates' => $successUpdates,
+        'failedUpdates' => $failedUpdates,
+        'totalSuccess' => count($successUpdates),
+        'totalFailed' => count($failedUpdates)
+    ];
+}
+
+try {
+    // Get jsonStartId from GET parameter
+    $jsonStartId = isset($_GET['jsonStartId']) ? intval($_GET['jsonStartId']) : 0;
+    
+    error_log("Received jsonStartId: " . $jsonStartId);
+    
+    // Process the tips and get results
+    $result = processJsonTips($jsonStartId);
+    
+    error_log("Processing complete, returning results");
+    error_log("newJsonStartId: " . $result['newJsonStartId']);
+    
+    
+    // Return result as JSON
+    header('Content-Type: application/json');
+    echo json_encode([
+        'success' => true,
+        'newJsonStartId' => $result['newJsonStartId'],
+        'stats' => [
+            'totalSuccess' => $result['totalSuccess'],
+            'totalFailed' => $result['totalFailed']
+        ],
+        'successUpdates' => $result['successUpdates'],
+        'failedUpdates' => $result['failedUpdates']
+    ]);
+    
+} catch (Exception $e) {
+    error_log("Error processing tips: " . $e->getMessage());
+    header('Content-Type: application/json');
+    http_response_code(500);
+    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+}

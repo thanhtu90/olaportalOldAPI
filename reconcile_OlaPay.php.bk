@@ -1,0 +1,392 @@
+<?php
+ini_set('display_errors', 1);
+error_reporting(E_ALL);
+set_time_limit(0); // Allow script to run for a long time
+
+include_once __DIR__ . "/library/utils.php";
+
+// Determine execution context and get parameters
+if (php_sapi_name() === 'cli') {
+    // Running from command line
+    $options = getopt("", ["vendors_id:", "from-date:", "from-jsonolapay-lastmod:", "to-jsonolapay-lastmod:", "debug"]);
+    $vendors_id_filter = $options['vendors_id'] ?? null;
+    $from_date = $options['from-date'] ?? null;
+    $from_jsonolapay_lastmod = $options['from-jsonolapay-lastmod'] ?? null;
+    $to_jsonolapay_lastmod = $options['to-jsonolapay-lastmod'] ?? null;
+    $debug_mode = isset($options['debug']);
+} else {
+    // Running from web browser
+    $vendors_id_filter = $_GET['vendors_id'] ?? null;
+    $from_date = $_GET['from-date'] ?? null;
+    $from_jsonolapay_lastmod = $_GET['from-jsonolapay-lastmod'] ?? null;
+    $to_jsonolapay_lastmod = $_GET['to-jsonolapay-lastmod'] ?? null;
+    $debug_mode = ($_GET['debug'] ?? 'false') === 'true';
+}
+
+// Helper function to parse lastmod parameter (supports Unix timestamp or date string)
+function parseLastmod($value) {
+    if ($value === null) {
+        return null;
+    }
+    
+    // If it's numeric, assume it's a Unix timestamp
+    if (is_numeric($value)) {
+        return (int)$value;
+    }
+    
+    // Otherwise, try to parse it as a date string
+    $timestamp = strtotime($value);
+    if ($timestamp === false) {
+        return false;
+    }
+    
+    return $timestamp;
+}
+
+// Validate parameters
+if (!$vendors_id_filter) {
+    http_response_code(400);
+    $error_message = "Please provide a vendors_id parameter.\n";
+    if (php_sapi_name() === 'cli') {
+        $error_message .= "Usage: php reconcile_OlaPay.php --vendors_id=ID [--from-date=YYYY-MM-DD] [--from-jsonolapay-lastmod=TIMESTAMP|DATE] [--to-jsonolapay-lastmod=TIMESTAMP|DATE] [--debug]\n";
+    } else {
+        $error_message .= "Example: ?vendors_id=123&from-date=2024-01-15&debug=true";
+    }
+    die($error_message);
+}
+
+// Validate that at least one date filter is provided
+if (!$from_date && !$from_jsonolapay_lastmod) {
+    http_response_code(400);
+    $error_message = "Please provide either --from-date or --from-jsonolapay-lastmod parameter.\n";
+    if (php_sapi_name() === 'cli') {
+        $error_message .= "Usage: php reconcile_OlaPay.php --vendors_id=ID [--from-date=YYYY-MM-DD] [--from-jsonolapay-lastmod=TIMESTAMP|DATE] [--to-jsonolapay-lastmod=TIMESTAMP|DATE] [--debug]\n";
+    } else {
+        $error_message .= "Example: ?vendors_id=123&from-date=2024-01-15&debug=true";
+    }
+    die($error_message);
+}
+
+// Validate from-date format if provided
+if ($from_date && !preg_match("/^\d{4}-\d{2}-\d{2}$/", $from_date)) {
+    http_response_code(400);
+    $error_message = "From-date must be in YYYY-MM-DD format.\n";
+    die($error_message);
+}
+
+// Parse lastmod parameters
+$from_lastmod_timestamp = null;
+if ($from_jsonolapay_lastmod) {
+    $from_lastmod_timestamp = parseLastmod($from_jsonolapay_lastmod);
+    if ($from_lastmod_timestamp === false) {
+        http_response_code(400);
+        die("Invalid --from-jsonolapay-lastmod format. Must be a Unix timestamp (integer) or a valid date string.\n");
+    }
+}
+
+$to_lastmod_timestamp = null;
+if ($to_jsonolapay_lastmod) {
+    $to_lastmod_timestamp = parseLastmod($to_jsonolapay_lastmod);
+    if ($to_lastmod_timestamp === false) {
+        http_response_code(400);
+        die("Invalid --to-jsonolapay-lastmod format. Must be a Unix timestamp (integer) or a valid date string.\n");
+    }
+}
+
+include_once __DIR__ . "/config/database.php";
+
+// Manually connect to the database
+try {
+    $databaseService = new DatabaseService();
+    $pdo = $databaseService->getConnection();
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+    
+    // Optimize database settings for bulk operations
+    try {
+        $pdo->exec("SET SESSION sql_mode = 'NO_AUTO_VALUE_ON_ZERO'");
+        $pdo->exec("SET SESSION autocommit = 1");
+        $pdo->exec("SET SESSION wait_timeout = 28800"); // 8 hours
+        $pdo->exec("SET SESSION interactive_timeout = 28800"); // 8 hours
+        $pdo->exec("SET SESSION net_write_timeout = 600"); // 10 minutes
+        $pdo->exec("SET SESSION net_read_timeout = 600"); // 10 minutes
+        
+        echo "Database optimized for bulk operations.\n";
+    } catch (PDOException $opt_e) {
+        echo "Note: Some database optimizations may not be available: " . $opt_e->getMessage() . "\n";
+        echo "Continuing with default settings...\n";
+    }
+} catch (PDOException $e) {
+    http_response_code(500);
+    error_log("Database connection failed: " . $e->getMessage());
+    die("Database connection failed.");
+}
+
+// Parse vendor IDs
+$vendor_ids = array_map('trim', explode(',', $vendors_id_filter));
+$vendor_ids = array_filter($vendor_ids, 'is_numeric'); // Only keep numeric values
+
+if (empty($vendor_ids)) {
+    echo "No valid vendor IDs provided in: $vendors_id_filter\n";
+    exit;
+}
+
+echo "Reconcile OlaPay Transactions\n";
+// query table account for company name from vendor ids
+$placeholders_accounts = implode(',', array_fill(0, count($vendor_ids), '?'));
+$stmt_accounts = $pdo->prepare("SELECT id, companyname FROM accounts WHERE id IN ($placeholders_accounts)");
+$stmt_accounts->execute($vendor_ids);
+$accounts = $stmt_accounts->fetchAll();
+foreach ($accounts as $account) {
+    echo "Vendor ID: " . $account['id'] . ", Business Name: " . $account['companyname'] . "\n";
+}
+
+// Determine the actual from timestamp to use
+$actual_from_timestamp = $from_lastmod_timestamp;
+if ($actual_from_timestamp === null && $from_date) {
+    $actual_from_timestamp = strtotime($from_date . ' 00:00:00');
+    if ($actual_from_timestamp === false) {
+        http_response_code(400);
+        die("Invalid from-date format: $from_date\n");
+    }
+}
+
+// Display filter information
+if ($from_date) {
+    echo "From Date: $from_date onwards\n";
+}
+if ($from_jsonolapay_lastmod) {
+    echo "From jsonOlaPay lastmod: " . date('Y-m-d H:i:s', $from_lastmod_timestamp) . " (timestamp: $from_lastmod_timestamp)\n";
+}
+if ($to_jsonolapay_lastmod) {
+    echo "To jsonOlaPay lastmod: " . date('Y-m-d H:i:s', $to_lastmod_timestamp) . " (timestamp: $to_lastmod_timestamp)\n";
+}
+echo "Debug mode: " . ($debug_mode ? "ON" : "OFF") . "\n\n";
+
+// Get all terminal serials for the specified vendors
+$placeholders = implode(',', array_fill(0, count($vendor_ids), '?'));
+$stmt_terminals = $pdo->prepare("SELECT serial FROM terminals WHERE vendors_id IN ($placeholders)");
+$stmt_terminals->execute($vendor_ids);
+$terminals = $stmt_terminals->fetchAll();
+
+if (empty($terminals)) {
+    echo "No terminals found for vendors_id: " . implode(', ', $vendor_ids) . "\n";
+    exit;
+}
+
+$terminal_serials = array_column($terminals, 'serial');
+echo "Found " . count($terminal_serials) . " terminals for vendors_id " . implode(', ', $vendor_ids) . "\n\n";
+
+// Query unique_olapay_transactions table (preferred) or fallback to jsonOlaPay
+// Using unique_olapay_transactions as it's the optimized deduplicated table
+$placeholders = implode(',', array_fill(0, count($terminal_serials), '?'));
+$sql = "SELECT id, serial, content, lastmod, order_id, trans_date, trans_id 
+        FROM unique_olapay_transactions 
+        WHERE serial IN ($placeholders) AND lastmod >= ?";
+
+$params = array_merge($terminal_serials, [$actual_from_timestamp]);
+
+// Add upper bound filter if provided
+if ($to_lastmod_timestamp !== null) {
+    $sql .= " AND lastmod <= ?";
+    $params[] = $to_lastmod_timestamp;
+}
+
+$sql .= " ORDER BY lastmod ASC, id ASC";
+
+if ($debug_mode) {
+    echo "Query: $sql\n";
+    echo "Params: " . implode(', ', $params) . "\n\n";
+}
+
+$stmt_olapay = $pdo->prepare($sql);
+$stmt_olapay->execute($params);
+$olapay_records = $stmt_olapay->fetchAll();
+
+if (empty($olapay_records)) {
+    $filter_info = [];
+    if ($from_date) {
+        $filter_info[] = "from date: $from_date";
+    }
+    if ($from_jsonolapay_lastmod) {
+        $filter_info[] = "from lastmod: $from_lastmod_timestamp";
+    }
+    if ($to_jsonolapay_lastmod) {
+        $filter_info[] = "to lastmod: $to_lastmod_timestamp";
+    }
+    echo "No OlaPay records found for vendors_id: " . implode(', ', $vendor_ids);
+    if (!empty($filter_info)) {
+        echo " with filters: " . implode(', ', $filter_info);
+    }
+    echo "\n";
+    exit;
+}
+
+$total_records = count($olapay_records);
+echo "Found $total_records OlaPay transaction records to process.\n\n";
+
+// Track start time for elapsed time calculation
+$start_time = time();
+
+// Initialize statistics
+$processed_count = 0;
+$transactions_by_type = [];
+$transactions_by_status = [];
+$total_amount = 0;
+$errors = [];
+
+// Process each record
+foreach ($olapay_records as $record) {
+    $processed_count++;
+    
+    // Calculate and display progress
+    $elapsed_seconds = time() - $start_time;
+    $elapsed_minutes = floor($elapsed_seconds / 60);
+    $elapsed_seconds_remainder = $elapsed_seconds % 60;
+    $elapsed_time_str = sprintf("%d:%02d", $elapsed_minutes, $elapsed_seconds_remainder);
+    
+    if ($processed_count % 100 == 0 || $debug_mode) {
+        echo "\n========== $processed_count/$total_records ==========\n";
+        echo "=== elapsed time : $elapsed_time_str ===\n";
+    }
+    
+    $serial = $record['serial'];
+    $content = $record['content'];
+    $lastmod = $record['lastmod'];
+    $order_id = $record['order_id'];
+    $trans_date = $record['trans_date'];
+    $trans_id = $record['trans_id'];
+    
+    // Parse JSON content
+    try {
+        $json_data = json_decode($content, true);
+        
+        if (!is_array($json_data)) {
+            $errors[] = "Invalid JSON content for record ID: {$record['id']}, Serial: $serial";
+            if ($debug_mode) {
+                echo "❌ SKIPPED: Invalid JSON content for record ID: {$record['id']}\n";
+            }
+            continue;
+        }
+        
+        // Extract transaction details
+        $trans_type = $json_data['trans_type'] ?? 'UNKNOWN';
+        $amount = isset($json_data['amount']) ? floatval($json_data['amount']) : 0;
+        $status = $json_data['Status'] ?? 'UNKNOWN';
+        $auth_code = $json_data['auth_code'] ?? null;
+        $command = $json_data['command'] ?? null;
+        $processor = $json_data['processor'] ?? null;
+        $response_message = $json_data['response_message'] ?? null;
+        
+        // Track statistics
+        if (!isset($transactions_by_type[$trans_type])) {
+            $transactions_by_type[$trans_type] = 0;
+        }
+        $transactions_by_type[$trans_type]++;
+        
+        if (!isset($transactions_by_status[$status])) {
+            $transactions_by_status[$status] = 0;
+        }
+        $transactions_by_status[$status]++;
+        
+        $total_amount += $amount;
+        
+        // Display transaction details in debug mode
+        if ($debug_mode) {
+            echo "Record ID: {$record['id']}\n";
+            echo "  Serial: $serial\n";
+            echo "  Order ID: " . ($order_id ?? 'N/A') . "\n";
+            echo "  Transaction ID: " . ($trans_id ?? 'N/A') . "\n";
+            echo "  Transaction Date: " . ($trans_date ?? 'N/A') . "\n";
+            echo "  Transaction Type: $trans_type\n";
+            echo "  Amount: $amount\n";
+            echo "  Status: $status\n";
+            echo "  Auth Code: " . ($auth_code ?? 'N/A') . "\n";
+            echo "  Command: " . ($command ?? 'N/A') . "\n";
+            echo "  Processor: " . ($processor ?? 'N/A') . "\n";
+            echo "  Response: " . ($response_message ?? 'N/A') . "\n";
+            echo "  Last Modified: " . date('Y-m-d H:i:s', $lastmod) . "\n";
+            echo "\n";
+        }
+        
+        // TODO: Add reconciliation logic here
+        // This could include:
+        // - Matching transactions with orders
+        // - Validating transaction amounts
+        // - Checking for missing transactions
+        // - Generating reconciliation reports
+        // - Updating reconciliation status
+
+        // upsert unique_olapay_transactions table
+        $existingUniqueRecord = $pdo->prepare("
+            SELECT id FROM unique_olapay_transactions WHERE serial = ? AND trans_id = ?
+        ");
+        $existingUniqueRecord->execute([$serial, $trans_id]);
+        if ($existingUniqueRecord->rowCount() > 0) {
+            echo "Updating existing unique_olapay_transactions record for serial: $serial, trans_id: $trans_id\n";
+            $stmtUpdate = $pdo->prepare("
+                UPDATE unique_olapay_transactions SET content = ?, lastmod = ?, order_id = ?, trans_date = ?, trans_id = ? WHERE id = ?
+            ");
+            $stmtUpdate->execute([$content, $lastmod, $order_id, $trans_date, $trans_id, $existingUniqueRecord->fetch(PDO::FETCH_ASSOC)['id']]);
+        }else{
+            echo "Inserting new unique_olapay_transactions record for serial: $serial, trans_id: $trans_id\n";
+            $stmtInsert = $pdo->prepare("
+                INSERT INTO unique_olapay_transactions (serial, content, lastmod, order_id, trans_date, trans_id) VALUES (?, ?, ?, ?, ?, ?)
+            ");
+            $stmtInsert->execute([$serial, $content, $lastmod, $order_id, $trans_date, $trans_id]);
+        }
+        
+    } catch (Exception $e) {
+        $errors[] = "Error processing record ID: {$record['id']}, Serial: $serial, Error: " . $e->getMessage();
+        error_log("Error processing OlaPay record ID {$record['id']}: " . $e->getMessage());
+        if ($debug_mode) {
+            echo "❌ ERROR: " . $e->getMessage() . "\n";
+        }
+        continue;
+    }
+}
+
+// Display summary
+$elapsed_seconds = time() - $start_time;
+$elapsed_minutes = floor($elapsed_seconds / 60);
+$elapsed_seconds_remainder = $elapsed_seconds % 60;
+$elapsed_time_str = sprintf("%d:%02d", $elapsed_minutes, $elapsed_seconds_remainder);
+
+echo "\n";
+echo "========================================\n";
+echo "RECONCILIATION SUMMARY\n";
+echo "========================================\n";
+echo "Total Records Processed: $processed_count/$total_records\n";
+echo "Elapsed Time: $elapsed_time_str\n";
+echo "Total Amount: $" . number_format($total_amount, 2) . "\n";
+echo "\n";
+
+if (!empty($transactions_by_type)) {
+    echo "Transactions by Type:\n";
+    foreach ($transactions_by_type as $type => $count) {
+        echo "  $type: $count\n";
+    }
+    echo "\n";
+}
+
+if (!empty($transactions_by_status)) {
+    echo "Transactions by Status:\n";
+    foreach ($transactions_by_status as $status => $count) {
+        echo "  $status: $count\n";
+    }
+    echo "\n";
+}
+
+if (!empty($errors)) {
+    echo "Errors: " . count($errors) . "\n";
+    if ($debug_mode) {
+        foreach ($errors as $error) {
+            echo "  - $error\n";
+        }
+    }
+    echo "\n";
+}
+
+echo "Reconciliation completed.\n";
+?>
+

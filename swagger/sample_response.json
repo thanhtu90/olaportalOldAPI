@@ -1,0 +1,291 @@
+{
+  "payments": [
+    {
+      "amtPaid": 37.58000183105469,
+      "employeeId": 0,
+      "id": 197,
+      "lastMod": 1711059484,
+      "orderID": "226",
+      "orderReference": "226",
+      "payDate": "Mar 21, 2024 3:18:03 PM",
+      "refNumber": "12",
+      "refund": 0.0,
+      "status": "PAID",
+      "techfee": 1.25,
+      "tips": 4.900000095367432,
+      "total": 37.58
+    }
+  ],
+  "items": [
+    {
+      "item": {
+        "amountOnHand": 99999,
+        "cost": 0.0,
+        "description": "Tacos",
+        "group": 322,
+        "id": 2017,
+        "largeImage": "#009cef",
+        "lastMod": 1709927801,
+        "notes": "",
+        "price": 3.25,
+        "smallImage": "",
+        "taxRate": 9.125,
+        "taxable": 1,
+        "upc": ""
+      },
+      "mods": [
+        {
+          "amountOnHand": 9999,
+          "cost": 0.0,
+          "description": "Extra Huevos",
+          "group": 338,
+          "id": 2210,
+          "largeImage": "",
+          "lastMod": 1709927802,
+          "notes": "",
+          "price": 3.0,
+          "smallImage": "",
+          "taxRate": 0.0,
+          "taxable": 1,
+          "upc": ""
+        },
+        {
+          "amountOnHand": 9999,
+          "cost": 0.0,
+          "description": "Chorizo salvadoreno",
+          "group": 338,
+          "id": 2211,
+          "largeImage": "",
+          "lastMod": 1709927802,
+          "notes": "",
+          "price": 3.0,
+          "smallImage": "",
+          "taxRate": 0.0,
+          "taxable": 1,
+          "upc": ""
+        },
+        {
+          "amountOnHand": 9999,
+          "cost": 0.0,
+          "description": "Loroco",
+          "group": 338,
+          "id": 2212,
+          "largeImage": "",
+          "lastMod": 1709927802,
+          "notes": "",
+          "price": 3.0,
+          "smallImage": "",
+          "taxRate": 0.0,
+          "taxable": 1,
+          "upc": ""
+        },
+        {
+          "amountOnHand": 9999,
+          "cost": 0.0,
+          "description": "Crema",
+          "group": 339,
+          "id": 2213,
+          "largeImage": "",
+          "lastMod": 1709927802,
+          "notes": "",
+          "price": 2.5,
+          "smallImage": "",
+          "taxRate": 0.0,
+          "taxable": 1,
+          "upc": ""
+        },
+        {
+          "amountOnHand": 9999,
+          "cost": 0.0,
+          "description": "Lechera",
+          "group": 339,
+          "id": 2214,
+          "largeImage": "",
+          "lastMod": 1709927802,
+          "notes": "",
+          "price": 2.5,
+          "smallImage": "",
+          "taxRate": 0.0,
+          "taxable": 1,
+          "upc": ""
+        },
+        {
+          "amountOnHand": 9999,
+          "cost": 0.0,
+          "description": "Campechana (Pulpo Y Pepino)",
+          "group": 340,
+          "id": 2215,
+          "largeImage": "",
+          "lastMod": 1709927802,
+          "notes": "",
+          "price": 3.0,
+          "smallImage": "",
+          "taxRate": 0.0,
+          "taxable": 1,
+          "upc": ""
+        }
+      ],
+      "orderItem": {
+        "cost": 0.0,
+        "description": "Tacos",
+        "discount": 1.6,
+        "group": 322,
+        "id": 645,
+        "itemAddedDateTime": "Mar 21, 2024 3:17:25 PM",
+        "itemId": 2017,
+        "lastMod": 1711059445,
+        "notes": "",
+        "orderReference": 226,
+        "price": 3.25,
+        "qty": 1,
+        "status": "READY_TO_PAY",
+        "taxAmount": 9.125,
+        "taxable": 1
+      }
+    },
+    {
+      "item": {
+        "amountOnHand": 99999,
+        "cost": 0.0,
+        "description": "Tacos",
+        "group": 322,
+        "id": 2017,
+        "largeImage": "#009cef",
+        "lastMod": 1709927801,
+        "notes": "",
+        "price": 3.25,
+        "smallImage": "",
+        "taxRate": 9.125,
+        "taxable": 1,
+        "upc": ""
+      },
+      "mods": [
+        {
+          "amountOnHand": 9999,
+          "cost": 0.0,
+          "description": "Chorizo salvadoreno",
+          "group": 338,
+          "id": 2211,
+          "largeImage": "",
+          "lastMod": 1709927802,
+          "notes": "",
+          "price": 3.0,
+          "smallImage": "",
+          "taxRate": 0.0,
+          "taxable": 1,
+          "upc": ""
+        },
+        {
+          "amountOnHand": 9999,
+          "cost": 0.0,
+          "description": "Lechera",
+          "group": 339,
+          "id": 2214,
+          "largeImage": "",
+          "lastMod": 1709927802,
+          "notes": "",
+          "price": 2.5,
+          "smallImage": "",
+          "taxRate": 0.0,
+          "taxable": 1,
+          "upc": ""
+        },
+        {
+          "amountOnHand": 9999,
+          "cost": 0.0,
+          "description": "Campechana (Pulpo Y Pepino)",
+          "group": 340,
+          "id": 2215,
+          "largeImage": "",
+          "lastMod": 1709927802,
+          "notes": "",
+          "price": 3.0,
+          "smallImage": "",
+          "taxRate": 0.0,
+          "taxable": 1,
+          "upc": ""
+        }
+      ],
+      "orderItem": {
+        "cost": 0.0,
+        "description": "Tacos",
+        "discount": 1.6,
+        "group": 322,
+        "id": 646,
+        "itemAddedDateTime": "Mar 21, 2024 3:17:31 PM",
+        "itemId": 2017,
+        "lastMod": 1711059451,
+        "notes": "",
+        "orderReference": 226,
+        "price": 3.25,
+        "qty": 1,
+        "status": "READY_TO_PAY",
+        "taxAmount": 9.125,
+        "taxable": 1
+      }
+    }
+  ],
+  "orders": [
+    {
+      "employeeId": 0,
+      "id": 226,
+      "lastMod": 1711059484,
+      "notes": "",
+      "orderDate": "Mar 21, 2024 3:17:25 PM",
+      "orderName": "",
+      "status": "PAID",
+      "subTotal": 28.8,
+      "tax": 2.63,
+      "total": 37.58000183105469
+    }
+  ],
+  "groups": [
+    {
+      "description": "Food Menu",
+      "groupType": "PARENT_GROUP",
+      "id": 322,
+      "lastMod": 1709927800,
+      "notes": ""
+    },
+    {
+      "description": "Food Menu",
+      "groupType": "PARENT_GROUP",
+      "id": 322,
+      "lastMod": 1709927800,
+      "notes": ""
+    }
+  ],
+  "itemdata": [
+    {
+      "amountOnHand": 99999,
+      "cost": 0.0,
+      "description": "Tacos",
+      "group": 322,
+      "id": 2017,
+      "largeImage": "#009cef",
+      "lastMod": 1709927801,
+      "notes": "",
+      "price": 3.25,
+      "smallImage": "",
+      "taxRate": 9.125,
+      "taxable": 1,
+      "upc": ""
+    },
+    {
+      "amountOnHand": 99999,
+      "cost": 0.0,
+      "description": "Tacos",
+      "group": 322,
+      "id": 2017,
+      "largeImage": "#009cef",
+      "lastMod": 1709927801,
+      "notes": "",
+      "price": 3.25,
+      "smallImage": "",
+      "taxRate": 9.125,
+      "taxable": 1,
+      "upc": ""
+    }
+  ],
+  "termId": ""
+}

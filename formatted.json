@@ -1,0 +1,110 @@
+{
+  "isOnlinePlatform": true,
+  "hasInventory": false,
+  "payments": [
+    {
+      "amtPaid": "0.01",
+      "employeeId": 0,
+      "id": "4",
+      "lastMod": 1739350175,
+      "orderID": 3,
+      "orderUUID": "ec3ba98a-ed2b-4d71-8078-e0114ed6370f",
+      "orderReference": 3,
+      "payDate": "02/12/2025 08:50:19 AM",
+      "refNumber": "4",
+      "refund": 0,
+      "status": "PAID",
+      "techfee": 0,
+      "tips": 0,
+      "total": "0.01"
+    }
+  ],
+  "items": [
+    {
+      "item": {
+        "id": 87244,
+        "crv": 0,
+        "upc": "",
+        "cost": 1,
+        "name": "testing-item",
+        "uuid": "080c2875-ed4e-4b27-9385-b8c940a3c68b",
+        "group": 38129,
+        "isEbt": 0,
+        "notes": "",
+        "price": 0.01,
+        "lastMod": 1739347906,
+        "taxRate": 0,
+        "taxable": 0,
+        "priceInt": 1,
+        "printType": 0,
+        "isWeighted": 0,
+        "largeImage": "",
+        "smallImage": "",
+        "crv_taxable": false,
+        "description": "testing-item",
+        "amountOnHand": 99999,
+        "isManualPrice": 0
+      },
+      "mods": [],
+      "orderItem": {
+        "id": 87244,
+        "crv": 0,
+        "upc": "",
+        "cost": 1,
+        "name": "testing-item",
+        "uuid": "080c2875-ed4e-4b27-9385-b8c940a3c68b",
+        "group": 38129,
+        "isEbt": 0,
+        "notes": "",
+        "price": 0.01,
+        "lastMod": 1739347906,
+        "taxRate": 0,
+        "taxable": 0,
+        "priceInt": 1,
+        "printType": 0,
+        "isWeighted": 0,
+        "largeImage": "",
+        "smallImage": "",
+        "crv_taxable": false,
+        "description": "testing-item",
+        "amountOnHand": 123,
+        "isManualPrice": 0,
+        "orderReference": 3,
+        "discount": 0,
+        "status": "READY_TO_PAY",
+        "qty": 1,
+        "taxAmount": "0.00"
+      }
+    }
+  ],
+  "orders": [
+    {
+      "employeeId": 0,
+      "id": 3,
+      "lastMod": 1739350175,
+      "notes": "",
+      "uuid": "ec3ba98a-ed2b-4d71-8078-e0114ed6370f",
+      "orderReference": 3,
+      "onlineorder_id": "83-213-4",
+      "onlinetrans_id": "385043318209360",
+      "orderDate": "2025-02-12T08:49:35.779Z",
+      "orderName": "",
+      "status": "PAID",
+      "subTotal": 0.01,
+      "tax": 0,
+      "delivery_fee": 0,
+      "delivery_type": "SELF-PICKUP",
+      "total": 0.01
+    }
+  ],
+  "groups": [
+    {
+      "id": 38129,
+      "description": "Taco",
+      "groupType": 1,
+      "lastMod": 1721772657
+    }
+  ],
+  "itemdata": [],
+  "termId": "0e0e3cbf-2064-407f-9e8d-4b0078beb128"
+}

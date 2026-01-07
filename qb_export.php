@@ -1,0 +1,135 @@
+<?php
+// qb_token_poll.php
+require_once('vendor/autoload.php');
+include_once "./library/utils.php";
+$config = require './config/qb_config.php';
+
+ini_set('max_execution_time', 1800);
+
+header('Content-Type: application/json');
+
+enable_cors();
+
+// Simply use $_GET
+$vendorId = $_GET['id'] ?? null;
+if (!$vendorId) {
+    http_response_code(400);
+    echo json_encode([
+        'status' => 'error',
+        'error' => 'Vendor ID is required'
+    ]);
+    exit;
+}
+
+$pdo = connect_db_and_set_http_method("GET","DELETE");
+
+error_log("Vendor ID: " . $vendorId);
+
+$current_ts = (int)time();
+
+$stmt_qb_token = $pdo->prepare("
+    SELECT *
+    FROM quickbooks_token_cred 
+    WHERE vendor_id = :vendor_id 
+    AND token_expire > :current_ts
+    ORDER BY lastmod DESC
+    LIMIT 1
+");
+
+$stmt_qb_token->execute([
+   ':vendor_id' => $vendorId,
+   ':current_ts' => $current_ts
+]);
+
+$result = $stmt_qb_token->fetch();
+
+error_log("QB Token result: " . $result);
+
+$token_key = $result['token_key'];
+$realm_id = $result['realm_id'];
+$token_type = $result['token_type'];
+error_log('Token key: ' . print_r($token_key, true));
+
+$stmt_merchant = $pdo->prepare("
+    SELECT email
+    FROM accounts 
+    WHERE id = :vendor_id 
+");
+$stmt_merchant->execute([
+   ':vendor_id' => $vendorId,
+]);
+$email = $stmt_merchant->fetchColumn();
+
+$stmt = $pdo->prepare("
+    SELECT *
+    FROM quickbooks_export_queue 
+    WHERE vendor_id = :vendor_id
+    ORDER BY lastmod ASC
+");
+
+$stmt->execute([
+   ':vendor_id' => $vendorId,
+]);
+
+// Initialize timing variables before the loop
+$total_delete_time = 0;
+$total_curl_time = 0;
+
+// Initialize cURL session
+$curl = curl_init();
+
+while ( $row = $stmt->fetch() ) {
+    error_log('Batch id: ' . print_r($row['id'], true));
+    $decoded_payload = json_decode($row['payload']); //strip the slashes added from storing in sql db
+    error_log('Payload: ' . print_r(json_encode($decoded_payload),true));
+    $url = $config['baseApiUrl']."/{$realm_id}".$config['batchSuffix'].$config['minorVersion'];
+    error_log('URL: ' . print_r($url,true));
+    curl_setopt_array($curl, array(
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,  
+        CURLOPT_HTTPHEADER => array(
+            'Accept: application/json',
+            'Authorization: Bearer ' . $token_key,
+            'Content-Type: application/json'
+        ),
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => json_encode($decoded_payload)
+    ));
+    
+    // Time the curl operation
+    $curl_start = microtime(true);
+    $response = curl_exec($curl);
+    $curl_end = microtime(true);
+    $total_curl_time += ($curl_end - $curl_start);
+
+    $http_status = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+
+    // Time the delete operation
+    $delete_start = microtime(true);
+    $stmt_delete = $pdo->prepare("
+                    DELETE FROM quickbooks_export_queue 
+                    WHERE id = :id
+                    ");
+
+    $stmt_delete->execute([
+                       ':id' => $row['id'],
+                    ]); 
+    $delete_end = microtime(true);
+    $total_delete_time += ($delete_end - $delete_start);
+    
+    if (curl_errno($curl)) {
+        error_log('Curl error: ' . curl_error($curl));  // Add this line
+        continue;
+    }
+    
+    $decoded_response = json_decode($response, true);
+    error_log('Export response : ' . print_r($decoded_response, true));
+}
+
+// Log the total times after the loop completes
+error_log(sprintf('Total DELETE operation time: %.4f seconds', $total_delete_time));
+error_log(sprintf('Total CURL operation time: %.4f seconds', $total_curl_time));
+
+mail($email,"OlaPortal Quickbook Export finished","The Quickbook Exporting Operation has finished. Please go to your Quickbook Online account to check the exported data","From: <noreply@olapay.us>\r\n");

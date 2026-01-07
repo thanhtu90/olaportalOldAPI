@@ -1,0 +1,45 @@
+<?php
+include_once "./library/utils.php";
+enable_cors();
+$pdo = connect_db_and_set_http_method( "GET" );
+$tablename = "accounts";
+$msgforinvalidjwt = "No permission";
+
+require "vendor/autoload.php";
+use \Firebase\JWT\JWT;
+
+#check jwt validity
+$jwt = getBearerToken();
+try {
+    $decoded = JWT::decode($jwt, "YOUR_SECRET_KEY", array('HS256'));
+} catch ( Exception $e ){
+    send_http_status_and_exit("403",$msgforinvalidjwt);
+    //var_dump( $e->getMessage() );
+}
+
+#check admin priv
+#$role = $decoded->{'data'}->{'role'};
+#if ( $role != "admin" ) { send_http_status_and_exit("403",$msgforinvalidjwt); }
+
+#get data from database
+$res = array();
+$res["data"] = array();
+
+$stmt = $pdo->prepare("select * from accounts where id = ?");
+$stmt->execute([ $_REQUEST["accountsId"] ]);
+$row = $stmt->fetch();
+$res["companyname"] = $row["companyname"];
+
+$stmt = $pdo->prepare("select * from accounts where role = 'vendor' and accounts_id = ? order by id desc");
+$stmt->execute([ $_REQUEST["accountsId"] ]);
+while ( $row = $stmt->fetch() ) {
+    $entry = array();
+    $entry["id"] = $row["id"];
+    $entry["name"] = $row["firstname"] . " " . $row["lastname"];
+    $entry["email"] = $row["email"];
+    $entry["enterdate"] = $row["enterdate"];
+    $entry["role"] = $row["role"];
+    array_push( $res["data"], $entry );
+}
+send_http_status_and_exit("200",json_encode($res));
+?>

@@ -1,0 +1,115 @@
+<?php
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+include_once "./library/utils.php";
+enable_cors();
+
+// Date range calculation
+$tomorrow = strtotime('tomorrow');
+$starttime = null;
+$endtime = null;
+
+switch ($_REQUEST["datetype"]) {
+  case "Last 30 Days":
+    $starttime = $tomorrow - 86400 * 30;
+    $endtime = strtotime('now');
+    break;
+  case "Last 24 Hours":
+    $tomorrow = strtotime('next hour');
+    $starttime = $tomorrow - 86400;
+    $endtime = strtotime('now');
+    break;
+  case "Last 52 Weeks":
+    $starttime = $tomorrow - 86400 * 52 * 7;
+    $endtime = strtotime('now');
+    break;
+  case "Custom":
+    $starttime = strtotime($_REQUEST["fromDate"]);
+    $endtime = strtotime($_REQUEST["toDate"]) + 86400;
+    break;
+}
+
+// Database connection and error messages
+$msgfornoterminal = "No permission";
+$msgforsqlerror = "Unable to get data";
+$pdo = connect_db_and_set_http_method("GET");
+
+// Build WHERE clause based on type
+$where = "";
+switch ($_REQUEST["type"]) {
+  case "agent":
+    $where = 'AND ordersPayments.agents_id = :id';
+    break;
+  case "merchant":
+    $where = 'AND ordersPayments.vendors_id = :id';
+    break;
+  case "terminal":
+    $where = 'AND ordersPayments.terminals_id = :id';
+    break;
+}
+
+// Initialize response array
+$res = [
+  "count_items" => [],
+  "amount_items" => [],
+  "max_count" => 0
+];
+
+// Get OlaPOS merchant IDs
+$olapos_merchants_query = "
+    SELECT DISTINCT accounts.id
+    FROM accounts
+    JOIN terminals ON terminals.vendors_id = accounts.id
+    JOIN terminal_payment_methods ON terminal_payment_methods.terminal_id = terminals.id
+    JOIN payment_methods ON payment_methods.id = terminal_payment_methods.payment_method_id
+    WHERE payment_methods.code = 'olapos'";
+
+$stmt_merchants = $pdo->query($olapos_merchants_query);
+$olapos_merchant_ids = $stmt_merchants->fetchAll(PDO::FETCH_COLUMN);
+
+// Modify the main query to include OlaPOS merchant filter
+$query = "SELECT 
+    accounts.id,
+    accounts.companyname AS business,
+    COUNT(DISTINCT orders.id) AS transactions,
+    SUM(ordersPayments.refund) AS refund,
+    SUM(ordersPayments.total) AS amount
+FROM orders
+JOIN ordersPayments ON orders.id = ordersPayments.orderReference
+JOIN accounts ON orders.vendors_id = accounts.id
+WHERE orders.lastMod >= :starttime 
+AND orders.lastMod <= :endtime
+AND accounts.id IN (" . implode(',', $olapos_merchant_ids ?: [0]) . ")
+{$where}
+GROUP BY orders.vendors_id
+ORDER BY amount DESC
+LIMIT 10";
+
+$stmt = $pdo->prepare($query);
+$params = [':starttime' => $starttime, ':endtime' => $endtime];
+
+if ($_REQUEST["type"] !== "site") {
+  $params[':id'] = $_REQUEST["id"];
+}
+
+$stmt->execute($params);
+
+// Process results
+while ($row = $stmt->fetch()) {
+  $entry = [
+    "id" => $row["id"],
+    "business" => $row["business"],
+    "transactions" => $row["transactions"],
+    "refund" => $row["refund"],
+    "amount" => (float)$row["amount"]
+  ];
+
+  if (isset($row["qty"]) && $row["qty"] > $res["max_count"]) {
+    $res["max_count"] = $row["qty"];
+  }
+
+  $res["count_items"][] = $entry;
+}
+
+send_http_status_and_exit("200", json_encode($res));

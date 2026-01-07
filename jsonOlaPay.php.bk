@@ -1,0 +1,51 @@
+<?php
+// v2 - support for unique_olapay_transactions table
+ini_set("display_errors",1);
+include_once "./library/utils.php";
+
+$msgfornoterminal = "No permission";
+$msgforsqlerror = "Unable to get data";
+$pdo = connect_db_and_set_http_method("POST");
+
+// Insert into original jsonOlaPay table (maintain backward compatibility)
+$stmt = $pdo->prepare("insert into jsonOlaPay set serial = ?, content = ?, lastmod = ?");
+$stmt->execute([$_REQUEST["serial"], $_REQUEST["content"], $_REQUEST["lastmod"]]);
+
+// Also insert into the new unique_olapay_transactions table
+try {
+    $content = $_REQUEST["content"];
+    $serial = $_REQUEST["serial"];
+    $lastmod = $_REQUEST["lastmod"];
+    
+    // Parse JSON content to extract uniqueness fields
+    $json_data = json_decode($content, true);
+    
+    if ($json_data !== null) {
+        // Extract the required fields for uniqueness
+        $order_id = isset($json_data['orderID']) ? $json_data['orderID'] : null;
+        $trans_date = isset($json_data['trans_date']) ? $json_data['trans_date'] : null;
+        $trans_id = isset($json_data['trans_id']) ? $json_data['trans_id'] : null;
+        
+        // Insert into new table (INSERT IGNORE will skip duplicates)
+        $stmt_unique = $pdo->prepare("
+            INSERT IGNORE INTO unique_olapay_transactions 
+            (serial, content, lastmod, order_id, trans_date, trans_id) 
+            VALUES (?, ?, ?, ?, ?, ?)
+        ");
+        
+        $stmt_unique->execute([
+            $serial,
+            $content,
+            $lastmod,
+            $order_id,
+            $trans_date,
+            $trans_id
+        ]);
+    }
+} catch (Exception $e) {
+    // Log error but don't fail the main operation
+    error_log("Error inserting into unique_olapay_transactions: " . $e->getMessage());
+}
+
+send_http_status_and_exit("200", json_encode(["status" => "success"]));
+?> 

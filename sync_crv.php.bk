@@ -1,0 +1,204 @@
+<?php
+ini_set('display_errors', 1);
+error_reporting(E_ALL);
+set_time_limit(0); // Allow script to run for a long time
+
+include_once __DIR__ . "/config/database.php";
+
+// Parse command-line arguments
+$options = getopt("", ["from-date:", "to-date:", "dry-run", "verbose"]);
+
+$from_date = $options['from-date'] ?? null;
+$to_date = $options['to-date'] ?? null;
+$dry_run = isset($options['dry-run']);
+$verbose = isset($options['verbose']);
+
+// Validate parameters
+if (!$from_date || !$to_date) {
+    echo "Usage: php sync_crv.php --from-date=YYYY-MM-DD --to-date=YYYY-MM-DD [--dry-run] [--verbose]\n";
+    echo "Example: php sync_crv.php --from-date=2025-11-01 --to-date=2025-11-24\n";
+    exit(1);
+}
+
+// Validate date format
+if (!preg_match("/^\d{4}-\d{2}-\d{2}$/", $from_date) || !preg_match("/^\d{4}-\d{2}-\d{2}$/", $to_date)) {
+    echo "Error: Dates must be in YYYY-MM-DD format.\n";
+    exit(1);
+}
+
+// Convert dates to timestamps (start of day for from_date, end of day for to_date)
+$from_timestamp = strtotime($from_date . " 00:00:00");
+$to_timestamp = strtotime($to_date . " 23:59:59");
+
+if ($from_timestamp === false || $to_timestamp === false) {
+    echo "Error: Invalid date format.\n";
+    exit(1);
+}
+
+if ($from_timestamp > $to_timestamp) {
+    echo "Error: from-date must be before or equal to to-date.\n";
+    exit(1);
+}
+
+// Connect to database
+try {
+    $databaseService = new DatabaseService();
+    $pdo = $databaseService->getConnection();
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+} catch (PDOException $e) {
+    echo "Error: Database connection failed: " . $e->getMessage() . "\n";
+    exit(1);
+}
+
+echo "=== CRV Sync Script ===\n";
+echo "Date range: {$from_date} to {$to_date}\n";
+echo "From timestamp: {$from_timestamp} (" . date('Y-m-d H:i:s', $from_timestamp) . ")\n";
+echo "To timestamp: {$to_timestamp} (" . date('Y-m-d H:i:s', $to_timestamp) . ")\n";
+if ($dry_run) {
+    echo "Mode: DRY RUN (no updates will be made)\n";
+}
+echo "\n";
+
+// Query orderItems that need crv update
+// We'll look for records where crv is NULL or 0, and have a valid itemUuid
+$sql = "SELECT oi.id, oi.itemUuid, oi.crv, oi.crv_taxable, oi.description, oi.itemsAddedDateTime
+        FROM orderItems oi
+        WHERE oi.itemsAddedDateTime >= ? 
+        AND oi.itemsAddedDateTime <= ?
+        AND oi.itemUuid IS NOT NULL
+        AND (oi.crv IS NULL OR oi.crv = 0)
+        ORDER BY oi.id";
+
+$stmt = $pdo->prepare($sql);
+$stmt->execute([$from_timestamp, $to_timestamp]);
+$orderItems = $stmt->fetchAll();
+
+$total_count = count($orderItems);
+echo "Found {$total_count} orderItems records that need CRV update.\n\n";
+
+if ($total_count == 0) {
+    echo "No records to update. Exiting.\n";
+    exit(0);
+}
+
+// Prepare statement to get crv from items table
+$items_stmt = $pdo->prepare("SELECT crv FROM items WHERE uuid = ? LIMIT 1");
+
+// Prepare statement to update orderItems
+$update_stmt = $pdo->prepare("UPDATE orderItems SET crv = ?, crv_taxable = ? WHERE id = ?");
+
+$updated_count = 0;
+$not_found_count = 0;
+$error_count = 0;
+$skipped_count = 0;
+
+// Process each orderItem
+foreach ($orderItems as $orderItem) {
+    $orderItemId = $orderItem['id'];
+    $itemUuid = $orderItem['itemUuid'];
+    $description = $orderItem['description'];
+    
+    if ($verbose) {
+        echo "Processing orderItem ID: {$orderItemId}, itemUuid: {$itemUuid}, description: {$description}\n";
+    }
+    
+    // Query items table for crv
+    try {
+        $items_stmt->execute([$itemUuid]);
+        $itemRow = $items_stmt->fetch();
+        
+        if (!$itemRow || !isset($itemRow['crv']) || $itemRow['crv'] === null) {
+            $not_found_count++;
+            if ($verbose) {
+                echo "  -> Item not found or crv is NULL in items table\n";
+            }
+            continue;
+        }
+        
+        // Parse crv from items table
+        $itemsCrv = $itemRow['crv'];
+        $crv = 0;
+        $crv_taxable = 0;
+        
+        // Handle different formats of crv
+        if (is_string($itemsCrv)) {
+            $itemsCrvDecoded = json_decode($itemsCrv, true);
+            if (is_array($itemsCrvDecoded)) {
+                // Format: {"val": "0.05", "is_taxable": false}
+                if (isset($itemsCrvDecoded["val"])) {
+                    $crv = floatval($itemsCrvDecoded["val"]);
+                    if (isset($itemsCrvDecoded["is_taxable"])) {
+                        $crv_taxable = $itemsCrvDecoded["is_taxable"] ? 1 : 0;
+                    }
+                }
+            } elseif (is_numeric($itemsCrvDecoded)) {
+                $crv = floatval($itemsCrvDecoded);
+            }
+        } elseif (is_numeric($itemsCrv)) {
+            $crv = floatval($itemsCrv);
+        } elseif (is_array($itemsCrv)) {
+            // PDO might return JSON as array directly
+            if (isset($itemsCrv["val"])) {
+                $crv = floatval($itemsCrv["val"]);
+                if (isset($itemsCrv["is_taxable"])) {
+                    $crv_taxable = $itemsCrv["is_taxable"] ? 1 : 0;
+                }
+            }
+        }
+        
+        // Skip if crv is still 0 after parsing
+        if ($crv == 0) {
+            $skipped_count++;
+            if ($verbose) {
+                echo "  -> CRV value is 0, skipping update\n";
+            }
+            continue;
+        }
+        
+        // Update orderItems
+        if (!$dry_run) {
+            try {
+                $update_stmt->execute([$crv, $crv_taxable, $orderItemId]);
+                $updated_count++;
+                if ($verbose) {
+                    echo "  -> Updated: crv={$crv}, crv_taxable={$crv_taxable}\n";
+                }
+            } catch (PDOException $e) {
+                $error_count++;
+                echo "  -> Error updating orderItem ID {$orderItemId}: " . $e->getMessage() . "\n";
+            }
+        } else {
+            $updated_count++;
+            if ($verbose) {
+                echo "  -> Would update: crv={$crv}, crv_taxable={$crv_taxable}\n";
+            }
+        }
+        
+    } catch (PDOException $e) {
+        $error_count++;
+        echo "  -> Error querying items table for itemUuid {$itemUuid}: " . $e->getMessage() . "\n";
+    }
+    
+    // Progress indicator
+    if (!$verbose && ($updated_count + $not_found_count + $error_count + $skipped_count) % 100 == 0) {
+        echo "Progress: " . ($updated_count + $not_found_count + $error_count + $skipped_count) . " / {$total_count}\n";
+    }
+}
+
+echo "\n=== Summary ===\n";
+echo "Total records processed: {$total_count}\n";
+echo "Successfully updated: {$updated_count}\n";
+echo "Items not found: {$not_found_count}\n";
+echo "Skipped (crv = 0): {$skipped_count}\n";
+echo "Errors: {$error_count}\n";
+
+if ($dry_run) {
+    echo "\nDRY RUN mode - no actual updates were made.\n";
+    echo "Run without --dry-run to apply updates.\n";
+} else {
+    echo "\nUpdates completed successfully.\n";
+}
+
+exit(0);
+

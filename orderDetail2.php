@@ -1,0 +1,99 @@
+<?php
+include_once "./library/utils.php";
+enable_cors();
+
+$msgfornoterminal = "No permission";
+$msgforsqlerror = "Unable to get data";
+$pdo = connect_db_and_set_http_method( "GET" );
+
+$entry = array();
+$res = array();
+$stmt = $pdo->prepare("select * from `orders` where id = ?");
+$stmt->execute([$_REQUEST["id"] ]);
+$row = $stmt->fetch();
+$entry["subTotal"] = $row["subTotal"];
+$entry["tax"] = $row["tax"];
+$entry["total"] = $row["total"];
+$entry["orderDetail"] = array();
+$entry["ordersPayments"] = array();
+$entry["discount"] = 0;
+$entry["status"] = $row["status"];
+$entry["orderReference"] = $row["orderReference"];
+$entry["orderUuid"] = $row["uuid"];
+$entry["secondaryTaxList"] = $row["secondary_tax_list"];
+
+// get terminal serial for front end to call api sync order items
+$stmt4 = $pdo->prepare("select * from `orders` inner join `terminals` on orders.terminals_id = terminals.id where orders.uuid = ?");
+$stmt4->execute([$row["uuid"]]);
+$row4 = $stmt4->fetch();
+$entry["terminalSerial"] = $row4["serial"];
+
+// $stmt2 = $pdo->prepare("select * from `orderItems` where orders_id = ? and items_id = 0");
+$stmt2 = $pdo->prepare("select * from `orderItems` where orderUuid = ? and items_id = 0");
+$stmt2->execute([ $row["uuid"] ]);
+while ( $row2 = $stmt2->fetch() ) {
+    $item = array();
+    $item["name"] = $row2["description"];
+    $item["amount"] = $row2["price"];
+    $item["quantity"] = $row2["qty"];
+    $entry["discount"] = $entry["discount"] + $row2["discount"] * $row2["qty"];
+    $item["itemDiscount"] = $row2["itemDiscount"];
+    $item["crv"] = $row2["crv"];
+    $item["techFeeRate"] = $row2["tech_fee_rate"];
+
+    $item["modifiers"] = array();
+    // $stmt3 = $pdo->prepare("select * from `orderItems` where orders_id = ? and items_id = ?");
+    $stmt3 = $pdo->prepare("select * from `orderItems` where orderUuid = ? and items_id = ?");
+    $stmt3->execute([$row["uuid"],$row2["id"]]);
+    while ( $row3 = $stmt3->fetch() ) {
+      $modifier = array();
+      $modifier["name"] = $row3["description"];
+      $modifier["amount"] = $row3["price"];
+      array_push($item["modifiers"],$modifier);
+    }
+    array_push( $entry["orderDetail"], $item);
+}
+
+// $stmt2 = $pdo->prepare("select * from `ordersPayments` where orderReference = ?");
+$stmt2 = $pdo->prepare("select * from `ordersPayments` where orderUuid = ?");
+$stmt2->execute([ $row["uuid"] ]);
+
+// Temporary array to store payments by UUID for deduplication
+$paymentsByUuid = array();
+
+while ( $row2 = $stmt2->fetch() ) {
+    $item = array();
+    $item["total"] = $row2["total"];
+    $item["tip"] = $row2["tips"];
+    $item["techFee"] = $row2["techFee"];
+    $item["refund"] = $row2["refund"];
+    $item["amtPaid"] = $row2["amtPaid"];
+    $item["originalTotal"] = $row2["originalTotal"] ?? null;
+    $item["payMethod"] = "Card";
+    if ( $row2["refNumber"] == "CASH" ) { $item["payMethod"] = "Cash"; }
+    if ( $row2["refNumber"] == "GIFT" ) { $item["payMethod"] = "Gift"; }
+    
+    // Add paymentUuid and paymentLastMod for deduplication logic
+    $item["paymentUuid"] = isset($row2["paymentUuid"]) ? $row2["paymentUuid"] : null;
+    $item["paymentLastMod"] = isset($row2["lastMod"]) ? $row2["lastMod"] : null;
+    
+    // Deduplicate by paymentUuid - keep the one with greatest paymentLastMod
+    if (!empty($item["paymentUuid"])) {
+        if (!isset($paymentsByUuid[$item["paymentUuid"]]) || 
+            $item["paymentLastMod"] > $paymentsByUuid[$item["paymentUuid"]]["paymentLastMod"]) {
+            $paymentsByUuid[$item["paymentUuid"]] = $item;
+        }
+    } else {
+        // If no paymentUuid, add directly (for backward compatibility)
+        array_push( $entry["ordersPayments"], $item);
+    }
+}
+
+// Add deduplicated payments to the final array
+foreach ($paymentsByUuid as $payment) {
+    array_push( $entry["ordersPayments"], $payment);
+}
+array_push( $res, $entry );
+
+send_http_status_and_exit("200",json_encode($res));
+?>

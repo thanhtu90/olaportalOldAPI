@@ -1,0 +1,112 @@
+<?php
+include_once "./library/utils.php";
+enable_cors();
+ini_set('display_errors', 1);
+error_reporting(E_ALL);
+
+###
+$tomorrow = strtotime('tomorrow');
+switch ( $_REQUEST["datetype"] ) {
+  case "Last 30 Days":
+    $starttime = $tomorrow - 86400*30;
+    $endtime = strtotime('now');
+    #$interval = 86400;
+    break;
+  case "Last 24 Hours":
+    $tomorrow = strtotime('next hour');
+    $starttime = $tomorrow - 86400;
+    $endtime = strtotime('now');
+    #$interval = 3600;
+    break;
+  case "Last 52 Weeks":
+    $starttime = $tomorrow - 86400*52*7;
+    $endtime = strtotime('now');
+    $interval = 86400*7;
+    break;
+  case "Custom":
+    $starttime = strtotime($_REQUEST["fromDate"]);
+    $endtime = strtotime($_REQUEST["toDate"]) + 86400;
+    #$interval = 86400;
+    break;
+}
+###
+
+$msgfornoterminal = "No permission";
+$msgforsqlerror = "Unable to get data";
+$pdo = connect_db_and_set_http_method( "GET" );
+
+$where = "";
+if ( $_REQUEST["type"] == "site" ) {}
+if ( $_REQUEST["type"] == "agent" ) { $where = 'and ordersPayments.agents_id = ?'; }
+if ( $_REQUEST["type"] == "merchant" ) { $where = 'and ordersPayments.vendors_id = ?'; }
+if ( $_REQUEST["type"] == "terminal" ) { $where = 'and ordersPayments.terminals_id = ?'; }
+
+$res = array();
+$res["count_items"] = array();
+$res["amount_items"] = array();
+
+$stmt = $pdo->prepare("
+WITH matching_orders AS (
+    SELECT DISTINCT orderItems.orders_id
+    FROM orderItems
+    INNER JOIN ordersPayments ON orderItems.orders_id = ordersPayments.orderReference
+    WHERE items_id = '0' " . $where . "
+    AND ordersPayments.lastMod > '" . $starttime . "'
+    AND ordersPayments.lastMod < '" . $endtime . "'
+    AND group_name != ''
+),
+subtotals AS (
+    SELECT group_name, SUM(qty) as qty, SUM(price*qty) as subtotal, price
+    FROM orderItems
+    INNER JOIN ordersPayments ON orderItems.orders_id = ordersPayments.orderReference
+    WHERE items_id = '0' " . $where . "
+    AND ordersPayments.lastMod > '" . $starttime . "'
+    AND ordersPayments.lastMod < '" . $endtime . "'
+    AND group_name != ''
+    GROUP BY group_name, price
+)
+SELECT 
+    s.group_name,
+    s.qty,
+    s.subtotal + COALESCE(t.tax, 0) as amt,
+    s.price,
+    COALESCE(t.tax, 0) as tax
+FROM subtotals s
+LEFT JOIN (
+    SELECT oi.group_name, SUM(o.tax) as tax
+    FROM orderItems oi
+    INNER JOIN orders o ON oi.orderUuid = o.uuid
+    WHERE oi.orders_id IN (SELECT orders_id FROM matching_orders)
+    AND oi.group_name != ''
+    GROUP BY oi.group_name
+) t ON s.group_name = t.group_name
+ORDER BY amt DESC
+");
+if ( $_REQUEST["type"] == "site" ) {
+  $stmt->execute([ ]);
+} else {
+  $stmt->execute([ $_REQUEST["id"], $_REQUEST["id"] ]);
+}
+$res["max_count"] = 0;
+while ( $row = $stmt->fetch() ) {
+    if ( $row["qty"] > $res["max_count"] ){ $res["max_count"] = $row["qty"]; }
+    $entry["name"] = $row["group_name"];
+    $entry["quantity"] = (int)$row["qty"];
+    $entry["amount"] = (float)$row["amt"];
+    $entry["price"] = (float)$row["price"];
+    $entry["tax"] = (float)$row["tax"];
+    array_push( $res["count_items"], $entry );
+}
+/*
+$stmt = $pdo->prepare("SELECT *, sum(price*qty) as amt FROM `orderItems`, `ordersPayments` where orderItems.orders_id = ordersPayments.orderReference and items_id = '0' " . $where . " and ordersPayments.lastMod > '" . $starttime . "' and ordersPayments.lastMod < '" . $endtime . "' group by `group_name` order by amt desc");
+$stmt->execute([ $_REQUEST["id"] ]);
+$res["max_amount"] = 0;
+while ( $row = $stmt->fetch() ) {
+    if ( $row["amt"] > $res["max_amount"] ){ $res["max_amount"] = $row["amt"]; }
+    $entry["name"] = $row["group_name"] . "($" . number_format($row["amt"],2) . ")";
+    $entry["value"] = (float)$row["amt"];
+    array_push( $res["amount_items"], $entry );
+}
+*/
+send_http_status_and_exit("200",json_encode($res));
+?>

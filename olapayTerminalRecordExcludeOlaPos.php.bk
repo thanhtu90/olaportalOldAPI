@@ -1,0 +1,100 @@
+<?php
+# v2 - optimized for unique_olapay_transactions table
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+include_once "./library/utils.php";
+require_once __DIR__ . '/vendor/autoload.php';
+enable_cors();
+
+use Spatie\Async\Pool;
+
+$tomorrow = strtotime('tomorrow');
+switch ($_REQUEST["datetype"]) {
+  case "Last 30 Days":
+    $starttime = $tomorrow - 86400*30;
+    $endtime = strtotime('now');
+    break;
+  case "Last 24 Hours":
+    $tomorrow = strtotime('next hour');
+    $starttime = $tomorrow - 86400;
+    $endtime = strtotime('now');
+    break;
+  case "Last 52 Weeks":
+    $starttime = $tomorrow - 86400*52*7;
+    $endtime = strtotime('now');
+    break;
+  case "Custom":
+    $starttime = strtotime($_REQUEST["fromDate"]);
+    $endtime = strtotime($_REQUEST["toDate"]) + 86400;
+    break;
+}
+
+$msgfornoterminal = "No permission";
+$msgforsqlerror = "Unable to get data";
+$pdo = connect_db_and_set_http_method("GET");
+
+$type = $_REQUEST["type"];
+$id = isset($_REQUEST["id"]) ? $_REQUEST["id"] : null;
+
+// 1. Fetch all terminals matching the criteria
+if ($type == "merchant") {
+    $terminalsStmt = $pdo->prepare(
+        "SELECT serial, description FROM terminals WHERE vendors_id = ? AND onlinestorename = ''"
+    );
+    $terminalsStmt->execute([$id]);
+} else {
+    $terminalsStmt = $pdo->prepare(
+        "SELECT t.serial, t.description FROM terminals t INNER JOIN accounts a ON t.vendors_id = a.id WHERE a.id != 172 AND a.id != 183 AND t.onlinestorename = ''"
+    );
+    $terminalsStmt->execute();
+}
+$terminals = $terminalsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+// 2. For each terminal, fetch its transactions in the date range
+$pool = Pool::create()->concurrency(4);
+foreach ($terminals as $terminal) {
+    $pool[] = async(function () use ($terminal, $starttime, $endtime) {
+        include_once __DIR__ . "/library/utils.php";
+        $pdo = connect_db_and_set_http_method("GET");
+        $stmt = $pdo->prepare("
+            SELECT u.lastmod, u.content
+            FROM unique_olapay_transactions u
+            WHERE u.serial = ?
+              AND u.lastmod > ?
+              AND u.lastmod < ?
+              AND u.status NOT IN ('', 'FAIL', 'REFUNDED')
+              AND u.trans_type NOT IN ('Return Cash', '', 'Auth')
+              AND NOT EXISTS (
+                SELECT 1
+                FROM ordersPayments op
+                INNER JOIN terminals t ON t.id = op.terminals_id
+                WHERE t.serial = u.serial
+                  AND op.olapayApprovalId = u.trans_id
+                  AND op.olapayApprovalId IS NOT NULL
+                  AND op.olapayApprovalId != ''
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM ordersPayments op
+                WHERE op.olapayApprovalId = u.order_id_prefix
+                  AND op.lastMod > ?
+                  AND op.lastMod < ?
+              )
+            ORDER BY u.lastmod DESC
+        ");
+        error_log($stmt->queryString);
+        error_log(print_r([$terminal['serial'], $starttime, $endtime, $starttime, $endtime], true));
+        $stmt->execute([$terminal['serial'], $starttime, $endtime, $starttime, $endtime]);
+        error_log(print_r($stmt->errorInfo(), true));
+        $records = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        return [
+            'serial' => $terminal['serial'],
+            'description' => $terminal['description'],
+            'records' => $records
+        ];
+    });
+}
+$results = $pool->wait();
+
+send_http_status_and_exit("200", json_encode($results));
+?> 

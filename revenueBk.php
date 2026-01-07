@@ -1,0 +1,199 @@
+<?php
+
+#TESTING VERSION
+
+include_once "./library/utils.php";
+enable_cors();
+
+$msgfornoterminal = "No permission";
+$msgforsqlerror = "Unable to insert data";
+$pdo = connect_db_and_set_http_method( "GET" );
+
+$revenue = 0;
+$ccRevenue = 0;
+$cashRevenue = 0;
+$giftCardRevenue = 0;
+$orders = 0;
+$amounts = array();
+$res = array();
+
+#check id existence
+if ( $_REQUEST["type"] != "site" ) {
+    switch ( $_REQUEST["type"] ) {
+        case "terminal":
+            $stmt = $pdo->prepare("select * from terminals where id = ?");
+            $stmt->execute([ $_REQUEST["id"] ]);
+            break;
+        case "merchant":
+            $stmt = $pdo->prepare("select * from accounts where id = ?");
+            $stmt->execute([ $_REQUEST["id"] ]);
+            break;
+        case "agent":
+            $stmt = $pdo->prepare("select * from accounts where id = ?");
+            $stmt->execute([ $_REQUEST["id"] ]);
+            break;
+    }
+    if ( $stmt->rowCount() == 0 ) {    
+        send_http_status_and_exit("403",$msgfornoterminal);   
+    } else {
+        #filling breadcrumb information
+        $row = $stmt->fetch();
+        switch ( $_REQUEST["type"] ) {
+            case "terminal":
+                $res["vendorCompanyname"] = get_company_name_from_id($pdo,$row["vendors_id"]);
+                $res["agentCompanyname"] = get_company_name_from_id($pdo,get_parent_id_from_id($pdo,$row["vendors_id"]));
+                $res["serial"] = $row["serial"];
+                break;
+            case "merchant":
+                $res["vendorCompanyname"] = get_company_name_from_id($pdo,$row["id"]);
+                $res["agentCompanyname"] = get_company_name_from_id($pdo,get_parent_id_from_id($pdo,$row["id"]));
+                break;
+            case "agent":
+                $res["agentCompanyname"] = get_company_name_from_id($pdo,$row["id"]);
+                break;
+        }
+    }
+}
+
+$days = 0;
+$tomorrow = strtotime('tomorrow');
+switch ( $_REQUEST["datetype"] ) {
+    case "Last 30 Days":
+        $starttime = $tomorrow - 86400*30;
+        $endtime = strtotime('now');
+        $interval = 86400;
+        break;
+    case "Last 24 Hours":
+        $tomorrow = strtotime('next hour');
+        $starttime = $tomorrow - 86400;
+        $endtime = strtotime('now');
+        $interval = 3600;
+        break;
+    case "Last 52 Weeks":
+        $starttime = $tomorrow - 86400*52*7;
+        $endtime = strtotime('now');
+        $interval = 86400*7;
+        break;
+    case "Custom":
+        $starttime = strtotime($_REQUEST["fromDate"]);
+        $endtime = strtotime($_REQUEST["toDate"]) + 86400;
+	$interval = 86400;
+
+	if ( $_REQUEST["fromDate"] == $_REQUEST["toDate"] ) {
+          $interval = 3600;
+	}
+        break;
+}
+
+switch ( $_REQUEST["type"] ) {
+    case "site":
+        $stmt = $pdo->prepare("select * from ordersPayments where lastMod > '" . $starttime . "' and lastMod < '" . $endtime . "' order by lastMod");
+        $stmt->execute([ ]); //$_REQUEST["id"]
+        break;
+    case "terminal":
+        $stmt = $pdo->prepare("select * from ordersPayments where terminals_id = ? and lastMod > '" . $starttime . "' and lastMod < '" . $endtime . "' order by lastMod");
+        $stmt->execute([ $_REQUEST["id"] ]);
+        break;
+    case "merchant":
+        $stmt = $pdo->prepare("select * from ordersPayments where vendors_id = ? and lastMod > '" . $starttime . "' and lastMod < '" . $endtime . "' order by lastMod");
+        $stmt->execute([ $_REQUEST["id"] ]);
+        break;
+    case "agent":
+        $stmt = $pdo->prepare("select * from ordersPayments where agents_id = ? and lastMod > '" . $starttime . "' and lastMod < '" . $endtime . "' order by lastMod");
+        $stmt->execute([ $_REQUEST["id"] ]);
+        break;
+}
+
+while ( $row = $stmt->fetch() ) {
+    $amtPaid = $row["total"];
+    if ( $_REQUEST["datetype"] == "Last 30 Days" ) {
+        $paydate = date('M-j',$row["lastMod"]);
+    }
+    if ( $_REQUEST["datetype"] == "Last 52 Weeks" ) {
+        $paydate = date('M-j',strtotime("this Monday",$row["lastMod"]));
+    }
+    if ( $_REQUEST["datetype"] == "Last 24 Hours" ) {
+        $paydate = date('H:00',strtotime("this Hour",$row["lastMod"]));
+    }
+    if ( $_REQUEST["datetype"] == "Custom" ) {
+	    $paydate = date('M-j',$row["lastMod"]);
+            if ( $_REQUEST["fromDate"] == $_REQUEST["toDate"] ) {
+                $paydate = date('H:00',strtotime("this Hour",$row["lastMod"]));
+	    }
+    }
+    if ( isset($amounts[$paydate]) ) {
+        $amounts[$paydate] = $amounts[$paydate] + $amtPaid;
+    } else {
+        $amounts[$paydate] = $amtPaid;
+    }
+    $revenue = $revenue + $amtPaid;
+    if ( preg_match("/CASH/",$row["refNumber"])   ) {
+        $cashRevenue = $cashRevenue + $amtPaid;    
+    } else if ( preg_match("/GIFTCARD/",$row["refNumber"]) ) {
+        $giftCardRevenue = $giftCardRevenue + $amtPaid;
+    } else {
+        $ccRevenue = $ccRevenue + $amtPaid;
+    }
+    #if ( $row["refNumber"] != "CASH" && $row["refNumber"] != "0" ) {
+    #    $ccRevenue = $ccRevenue + $amtPaid;
+    #}
+    #if ( $row["refNumber"] == "CASH" ) {
+    #    $cashRevenue = $cashRevenue + $amtPaid;
+    #
+    $orders++;
+}
+
+$res["revenue"] = number_format($revenue,2);
+$res["ccRevenue"] = number_format($ccRevenue,2);
+$res["cashRevenue"] = number_format($cashRevenue,2);
+$res["giftCardRevenue"] = number_format($giftCardRevenue,2);
+$res["orders"] = $orders;
+$res["items"] = array();
+
+$curtime = $starttime;
+#for ( $i = 0; $i < (($tomorrow - $starttime) / $interval); $i++ ) {
+for ( $i = 0; $i < (($endtime - $starttime) / $interval); $i++ ) {
+    $entry = array();
+    $entry["id"] = $i;
+    if ( $_REQUEST["datetype"] == "Last 24 Hours" ) {
+      $entry["date"] = date("H:00",$curtime);
+      #$entry["date"] = date("H",strtotime("next hour",$curtime));
+    }
+    if ( $_REQUEST["datetype"] == "Last 30 Days" ) {
+      $entry["date"] = date("M-j",$curtime);
+    }
+    if ( $_REQUEST["datetype"] == "Last 52 Weeks" ) {
+      $entry["date"] = date("M-j",strtotime("this Monday",$curtime));
+    }
+    if ( $_REQUEST["datetype"] == "Custom" ) {
+      $entry["date"] = date("M-j",$curtime);
+      if ( $_REQUEST["fromDate"] == $_REQUEST["toDate"] ) {
+        $entry["date"] = date("H:00",$curtime);
+      }
+    }
+    if ( isset($amounts[$entry["date"]]) ) {
+        #$entry["revenue"] = number_format($amounts[$entry["date"]],2);
+        $entry["revenue"] = $amounts[$entry["date"]];
+    } else {
+        $entry["revenue"] = 0;
+    }
+    array_push( $res["items"], $entry );
+    $curtime = $curtime + $interval;
+}
+
+send_http_status_and_exit("200",json_encode($res));
+
+function get_company_name_from_id($pdo,$id) {
+    $stmt2 = $pdo->prepare("select * from accounts where id = ?");
+    $stmt2->execute([ $id ]);
+    $row2 = $stmt2->fetch();
+    return $row2["companyname"];
+}
+
+function get_parent_id_from_id($pdo,$id) {
+    $stmt2 = $pdo->prepare("select * from accounts where id = ?");
+    $stmt2->execute([ $id ]);
+    $row2 = $stmt2->fetch();
+    return $row2["accounts_id"];
+}
+?>

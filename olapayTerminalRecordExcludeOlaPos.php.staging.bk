@@ -1,0 +1,285 @@
+<?php
+# v3 - optimized for unique_olapay_transactions table with linked transactions support
+# Performance optimizations:
+# - Split linked query into two targeted queries (refunds after endtime, originals before starttime)
+# - Refunds always happen AFTER sales, originals always happen BEFORE refunds
+# - Uses indexed trans_id column for original sale lookup
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+include_once "./library/utils.php";
+require_once __DIR__ . '/vendor/autoload.php';
+enable_cors();
+
+use Spatie\Async\Pool;
+
+$tomorrow = strtotime('tomorrow');
+switch ($_REQUEST["datetype"]) {
+  case "Last 30 Days":
+    $starttime = $tomorrow - 86400*30;
+    $endtime = strtotime('now');
+    break;
+  case "Last 24 Hours":
+    $tomorrow = strtotime('next hour');
+    $starttime = $tomorrow - 86400;
+    $endtime = strtotime('now');
+    break;
+  case "Last 52 Weeks":
+    $starttime = $tomorrow - 86400*52*7;
+    $endtime = strtotime('now');
+    break;
+  case "Custom":
+    $starttime = strtotime($_REQUEST["fromDate"]);
+    $endtime = strtotime($_REQUEST["toDate"]) + 86400;
+    break;
+}
+
+$msgfornoterminal = "No permission";
+$msgforsqlerror = "Unable to get data";
+$pdo = connect_db_and_set_http_method("GET");
+
+$type = $_REQUEST["type"];
+$id = isset($_REQUEST["id"]) ? $_REQUEST["id"] : null;
+
+// 1. Fetch all terminals matching the criteria
+if ($type == "merchant") {
+    $terminalsStmt = $pdo->prepare(
+        "SELECT serial, description FROM terminals WHERE vendors_id = ? AND onlinestorename = ''"
+    );
+    $terminalsStmt->execute([$id]);
+} else {
+    $terminalsStmt = $pdo->prepare(
+        "SELECT t.serial, t.description FROM terminals t INNER JOIN accounts a ON t.vendors_id = a.id WHERE a.id != 172 AND a.id != 183 AND t.onlinestorename = ''"
+    );
+    $terminalsStmt->execute();
+}
+$terminals = $terminalsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+// 2. For each terminal, fetch its transactions in the date range and linked transactions
+$pool = Pool::create()->concurrency(4);
+foreach ($terminals as $terminal) {
+    $pool[] = async(function () use ($terminal, $starttime, $endtime) {
+        include_once __DIR__ . "/library/utils.php";
+        $pdo = connect_db_and_set_http_method("GET");
+        
+        // Step 1: Get transactions in the date range
+        $stmt = $pdo->prepare("
+SELECT u.id, u.lastmod, u.content, u.trans_id,
+       JSON_UNQUOTE(JSON_EXTRACT(u.content, '$.original_trans_id')) as original_trans_id
+FROM unique_olapay_transactions u
+WHERE u.serial = ?
+  AND u.lastmod > ?
+  AND u.lastmod < ?
+  AND u.status NOT IN ('', 'FAIL', 'REFUNDED')
+  AND u.trans_type NOT IN ('Return Cash', '', 'Auth')
+  -- Condition 1: Match by trans_id with serial check
+  AND NOT EXISTS (
+    SELECT 1
+    FROM ordersPayments op
+    INNER JOIN terminals t ON t.id = op.terminals_id
+    WHERE t.serial = u.serial
+      AND op.olapayApprovalId = u.trans_id
+      AND op.olapayApprovalId IS NOT NULL
+      AND op.olapayApprovalId != ''
+  )
+  -- Condition 2: Match by order_id prefix with date range
+  AND NOT EXISTS (
+    SELECT 1
+    FROM ordersPayments op
+    WHERE op.olapayApprovalId = SUBSTRING_INDEX(u.order_id, '-', 1)
+      AND op.lastMod > ?
+      AND op.lastMod < ?
+  )
+ORDER BY u.lastmod DESC
+        ");
+        $stmt->execute([$terminal['serial'], $starttime, $endtime, $starttime, $endtime]);
+        $initialRecords = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        if (empty($initialRecords)) {
+            return [
+                'serial' => $terminal['serial'],
+                'description' => $terminal['description'],
+                'records' => []
+            ];
+        }
+        
+        // Step 2: Collect all trans_ids and original_trans_ids from initial results
+        $transIds = [];
+        $originalTransIds = [];
+        $existingIds = []; // Track IDs already in results to avoid duplicates
+        
+        foreach ($initialRecords as $record) {
+            $existingIds[$record['id']] = true;
+            if (!empty($record['trans_id'])) {
+                $transIds[] = $record['trans_id'];
+            }
+            if (!empty($record['original_trans_id']) && $record['original_trans_id'] !== 'null') {
+                $originalTransIds[] = $record['original_trans_id'];
+            }
+        }
+        
+        // Step 3: Find linked transactions outside the date range
+        // Split into two optimized queries:
+        // Query A: Refunds that happened AFTER our date range (lastmod >= endtime) referencing our sales
+        // Query B: Original sales that happened BEFORE our date range (lastmod < starttime) referenced by our refunds
+        $linkedRecords = [];
+        
+        // Query A: Find refunds/returns AFTER endtime that reference our sale trans_ids
+        // Refunds always happen after the original sale, so we only look forward in time
+        if (!empty($transIds)) {
+            $placeholders = implode(',', array_fill(0, count($transIds), '?'));
+            
+            $refundsStmt = $pdo->prepare("
+SELECT u.id, u.lastmod, u.content, u.trans_id,
+       JSON_UNQUOTE(JSON_EXTRACT(u.content, '$.original_trans_id')) as original_trans_id
+FROM unique_olapay_transactions u
+WHERE u.serial = ?
+  AND u.lastmod >= ?
+  AND u.status NOT IN ('', 'FAIL', 'REFUNDED')
+  AND u.trans_type NOT IN ('Return Cash', '', 'Auth')
+  -- Find refunds/returns that reference our sale transactions (using indexed trans_id lookup)
+  AND JSON_UNQUOTE(JSON_EXTRACT(u.content, '$.original_trans_id')) IN ($placeholders)
+  -- Condition: Exclude if already matched in ordersPayments
+  AND NOT EXISTS (
+    SELECT 1
+    FROM ordersPayments op
+    INNER JOIN terminals t ON t.id = op.terminals_id
+    WHERE t.serial = u.serial
+      AND op.olapayApprovalId = u.trans_id
+      AND op.olapayApprovalId IS NOT NULL
+      AND op.olapayApprovalId != ''
+  )
+ORDER BY u.lastmod ASC
+            ");
+            
+            $params = array_merge([$terminal['serial'], $endtime], $transIds);
+            $refundsStmt->execute($params);
+            $linkedRecords = array_merge($linkedRecords, $refundsStmt->fetchAll(PDO::FETCH_ASSOC));
+        }
+        
+        // Query B: Find original sales BEFORE starttime that our refunds reference
+        // Original sales always happen before their refunds, so we only look backward in time
+        if (!empty($originalTransIds)) {
+            $placeholders = implode(',', array_fill(0, count($originalTransIds), '?'));
+            
+            $originalsStmt = $pdo->prepare("
+SELECT u.id, u.lastmod, u.content, u.trans_id,
+       JSON_UNQUOTE(JSON_EXTRACT(u.content, '$.original_trans_id')) as original_trans_id
+FROM unique_olapay_transactions u
+WHERE u.serial = ?
+  AND u.lastmod < ?
+  AND u.status NOT IN ('', 'FAIL', 'REFUNDED')
+  AND u.trans_type NOT IN ('Return Cash', '', 'Auth')
+  -- Find original sales by their trans_id (uses indexed column)
+  AND u.trans_id IN ($placeholders)
+  -- Condition: Exclude if already matched in ordersPayments
+  AND NOT EXISTS (
+    SELECT 1
+    FROM ordersPayments op
+    INNER JOIN terminals t ON t.id = op.terminals_id
+    WHERE t.serial = u.serial
+      AND op.olapayApprovalId = u.trans_id
+      AND op.olapayApprovalId IS NOT NULL
+      AND op.olapayApprovalId != ''
+  )
+ORDER BY u.lastmod DESC
+            ");
+            
+            $params = array_merge([$terminal['serial'], $starttime], $originalTransIds);
+            $originalsStmt->execute($params);
+            $linkedRecords = array_merge($linkedRecords, $originalsStmt->fetchAll(PDO::FETCH_ASSOC));
+        }
+        
+        // Step 4: Merge records, avoiding duplicates
+        $allRecords = $initialRecords;
+        foreach ($linkedRecords as $linkedRecord) {
+            if (!isset($existingIds[$linkedRecord['id']])) {
+                $existingIds[$linkedRecord['id']] = true;
+                $allRecords[] = $linkedRecord;
+            }
+        }
+        
+        // Step 5: Group and sort records by transaction chain
+        // Build a map of original_trans_id -> records and trans_id -> record
+        $transIdToRecord = [];
+        $originalTransIdToRecords = [];
+        
+        foreach ($allRecords as $record) {
+            $transIdToRecord[$record['trans_id']] = $record;
+            $origTransId = $record['original_trans_id'];
+            if (!empty($origTransId) && $origTransId !== 'null') {
+                if (!isset($originalTransIdToRecords[$origTransId])) {
+                    $originalTransIdToRecords[$origTransId] = [];
+                }
+                $originalTransIdToRecords[$origTransId][] = $record;
+            }
+        }
+        
+        // Build groups: each group is headed by the original sale, followed by its linked transactions
+        $processed = [];
+        $groupedRecords = [];
+        
+        foreach ($allRecords as $record) {
+            if (isset($processed[$record['id']])) {
+                continue;
+            }
+            
+            // Find the root transaction (the original sale)
+            $rootTransId = $record['trans_id'];
+            $origTransId = $record['original_trans_id'];
+            
+            // If this record has an original_trans_id, try to find the root
+            if (!empty($origTransId) && $origTransId !== 'null') {
+                $rootTransId = $origTransId;
+            }
+            
+            // Get the root record
+            $rootRecord = isset($transIdToRecord[$rootTransId]) ? $transIdToRecord[$rootTransId] : null;
+            
+            // Add root record first if it exists and not processed
+            if ($rootRecord && !isset($processed[$rootRecord['id']])) {
+                $groupedRecords[] = [
+                    'lastmod' => $rootRecord['lastmod'],
+                    'content' => $rootRecord['content']
+                ];
+                $processed[$rootRecord['id']] = true;
+            }
+            
+            // Add all linked transactions (refunds/returns) sorted by lastmod
+            if (isset($originalTransIdToRecords[$rootTransId])) {
+                $linkedTrans = $originalTransIdToRecords[$rootTransId];
+                usort($linkedTrans, function($a, $b) {
+                    return $a['lastmod'] - $b['lastmod'];
+                });
+                
+                foreach ($linkedTrans as $linked) {
+                    if (!isset($processed[$linked['id']])) {
+                        $groupedRecords[] = [
+                            'lastmod' => $linked['lastmod'],
+                            'content' => $linked['content']
+                        ];
+                        $processed[$linked['id']] = true;
+                    }
+                }
+            }
+            
+            // If current record wasn't added yet (orphan or standalone)
+            if (!isset($processed[$record['id']])) {
+                $groupedRecords[] = [
+                    'lastmod' => $record['lastmod'],
+                    'content' => $record['content']
+                ];
+                $processed[$record['id']] = true;
+            }
+        }
+        
+        return [
+            'serial' => $terminal['serial'],
+            'description' => $terminal['description'],
+            'records' => $groupedRecords
+        ];
+    });
+}
+$results = $pool->wait();
+
+send_http_status_and_exit("200", json_encode($results));
+?> 

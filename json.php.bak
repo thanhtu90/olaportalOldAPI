@@ -1,0 +1,86 @@
+<?php
+ini_set("display_errors",1);
+include_once "./library/utils.php";
+//enable_cors();
+
+$msgfornoterminal = "No permission";
+$msgforsqlerror = "Unable to insert data";
+$pdo = connect_db_and_set_http_method( "POST" );
+$pdo->setAttribute( PDO::ATTR_ERRMODE, PDO::ERRMODE_WARNING );
+$params = get_params_from_http_body([
+    "serial",
+    "json"
+]);
+
+$stmt = $pdo->prepare("select * from terminals where serial = ?");
+$stmt->execute([ $params["serial"] ]);
+if ( $stmt->rowCount() == 0 ) {
+    send_http_status_and_exit("403",$msgfornoterminal);
+}
+$row = $stmt->fetch();
+
+#get terminal id, vendor id, and agent id
+$terminals_id = $row["id"];
+$vendors_id = $row["vendors_id"];
+$stmt2 = $pdo->prepare("select * from accounts where id = ?");
+$stmt2->execute([ $vendors_id ]);
+$row2 = $stmt2->fetch();
+$agents_id = $row2["accounts_id"];
+
+####log raw data
+#$params["json"] = str_replace('&quot;','"',$params["json"]);
+#$stmt = $pdo->prepare("insert into json set serial = ?, content = ?");
+#$res = $stmt->execute([ $params["serial"], $params["json"] ]);
+
+#deal with test data here
+#$stmt = $pdo->prepare("select * from json where id = ?");
+#$stmt->execute([ "105" ]);
+#$row = $stmt->fetch();
+$row["content"] = str_replace('&quot;','"',$params["json"]);
+$payments =json_decode(json_decode($row["content"])->{"payments"});
+$items_json = json_decode(json_decode($row["content"])->{"items"});
+for ( $i = 0; $i < count($payments); $i++) {
+  #check if lastmod exist, if so next
+  $amtPaid = $payments[$i]->{"amtPaid"};
+  #$payDate = $payments[$i]->{"payDate"};
+  $total = $payments[$i]->{"total"};
+  $lastMod = $payments[$i]->{"lastMod"};
+  $orderRef = $payments[$i]->{"orderReference"};
+  #echo $amtPaid . " " . $total . " " . $lastMod . " " . $orderRef;
+  $stmt = $pdo->prepare("select * from ordersPayments where lastMod = ?");
+  $stmt->execute([ $lastMod ]);
+  if ( $stmt->rowCount() != 0 ) { //should be zero
+  //if ( 0 ) {
+    continue;
+  } else {
+    $stmt = $pdo->prepare("insert into ordersPayments set agents_id = ?, vendors_id = ?, terminals_id = ?, amtPaid = ?, total = ?, lastMod = ?");
+    $stmt->execute([ $agents_id, $vendors_id, $terminals_id, $amtPaid, $total, $lastMod ]);
+    $orders_id = $pdo->lastInsertId();
+    #echo $newOrderId;
+  }
+  #insert and get new payment id
+  for ( $j = 0; $j < count($items_json); $j++ ) {
+    if ( $orderRef == $items_json[$j]->{"orderItem"}->{"orderReference"} ) {
+       #insert all item detail with new payment id
+      $col = (array) $items_json[$j]->{"orderItem"};
+      #var_dump( $col );
+      $stmt = $pdo->prepare("insert into orderItems set agents_id = ?, vendors_id = ?, terminals_id = ?, orders_id = ?, cost = ?, description = ?, group_id = ?, notes = ?, price = ?, taxable = ?, qty = ?");
+      $stmt->execute([ $agents_id, $vendors_id, $terminals_id, $orders_id, $col["cost"], $col["description"],  $col["group"], $col["notes"], $col["price"], $col["taxable"], $col["qty"]  ]);
+      $items_id = $pdo->lastInsertId();
+      for ( $k = 0; $k < count($items_json[$j]->{"mods"}); $k++ ) {
+        $col = (array) $items_json[$j]->{"mods"}[$k];
+	$stmt = $pdo->prepare("insert into orderItems set agents_id = ?, vendors_id = ?, terminals_id = ?, orders_id = ?, cost = ?, description = ?, group_id = ?, notes = ?, price = ?, taxable = ?, items_id = ?");
+        $stmt->execute([ $agents_id, $vendors_id, $terminals_id, $orders_id, $col["cost"], $col["description"],  $col["group"], $col["notes"], $col["price"], $col["taxable"], $items_id ]);
+      }
+    }
+  }
+}
+
+
+
+#if($res){
+send_http_status_and_exit("200","Data was successfully inserted.");
+#} else {
+#send_http_status_and_exit("400",$msgforsqlerror);
+#}
+?>

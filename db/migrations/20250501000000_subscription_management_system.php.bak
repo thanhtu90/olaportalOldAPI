@@ -1,0 +1,1055 @@
+<?php
+
+use Phinx\Migration\AbstractMigration;
+use Phinx\Db\Adapter\MysqlAdapter;
+
+class SubscriptionManagementSystem extends AbstractMigration
+{
+    public function up()
+    {
+        // First, integrate with the existing database to ensure customer table is ready
+        $this->integrateExistingDatabase();
+        
+        // Subscription Plans table
+        $this->table('subscription_plans', ['id' => false, 'primary_key' => ['id']])
+            ->addColumn('id', 'biginteger', ['identity' => true, 'signed' => false])
+            ->addColumn('uuid', 'string', ['limit' => 36, 'null' => false])
+            ->addColumn('name', 'string', ['limit' => 100, 'null' => false])
+            ->addColumn('description', 'text', ['null' => true])
+            ->addColumn('price', 'decimal', ['precision' => 10, 'scale' => 2, 'null' => false])
+            ->addColumn('billing_interval', 'enum', ['values' => ['daily', 'weekly', 'monthly', 'quarterly', 'annually'], 'null' => false])
+            ->addColumn('trial_days', 'integer', ['limit' => MysqlAdapter::INT_REGULAR, 'signed' => false, 'null' => false, 'default' => 0])
+            ->addColumn('features', 'json', ['null' => true])
+            ->addColumn('is_active', 'boolean', ['null' => false, 'default' => true])
+            ->addColumn('created_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addColumn('updated_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addIndex(['uuid'], ['unique' => true, 'name' => 'uk_plan_uuid'])
+            ->addIndex(['is_active'], ['name' => 'idx_plan_active'])
+            ->create();
+            
+        // Add ON UPDATE trigger for updated_at manually to avoid DEFAULT_GENERATED syntax issues
+        $this->execute("ALTER TABLE subscription_plans MODIFY updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP");
+        
+        // Billing Addresses table
+        $this->table('billing_addresses', ['id' => false, 'primary_key' => ['id']])
+            ->addColumn('id', 'biginteger', ['identity' => true, 'signed' => false])
+            ->addColumn('customer_id', 'biginteger', ['signed' => false, 'null' => false])
+            ->addColumn('address_line1', 'string', ['limit' => 255, 'null' => false])
+            ->addColumn('address_line2', 'string', ['limit' => 255, 'null' => true])
+            ->addColumn('city', 'string', ['limit' => 100, 'null' => false])
+            ->addColumn('state', 'string', ['limit' => 100, 'null' => true])
+            ->addColumn('postal_code', 'string', ['limit' => 20, 'null' => false])
+            ->addColumn('country', 'string', ['limit' => 2, 'null' => false])
+            ->addColumn('is_default', 'boolean', ['null' => false, 'default' => false])
+            ->addColumn('created_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addColumn('updated_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addIndex(['customer_id'], ['name' => 'idx_billing_customer'])
+            ->addForeignKey('customer_id', 'customer', 'id', ['delete' => 'CASCADE', 'update' => 'NO_ACTION'])
+            ->create();
+            
+        // Add ON UPDATE trigger for updated_at manually
+        $this->execute("ALTER TABLE billing_addresses MODIFY updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP");
+        
+        // Payment Methods table
+        $this->table('payment_methods', ['id' => false, 'primary_key' => ['id']])
+            ->addColumn('id', 'biginteger', ['identity' => true, 'signed' => false])
+            ->addColumn('customer_id', 'biginteger', ['signed' => false, 'null' => false])
+            ->addColumn('payment_type', 'enum', ['values' => ['credit_card', 'debit_card', 'bank_account', 'paypal', 'other'], 'null' => false])
+            ->addColumn('payment_token', 'string', ['limit' => 255, 'null' => false])
+            ->addColumn('last_four', 'string', ['limit' => 4, 'null' => true])
+            ->addColumn('expiry_date', 'string', ['limit' => 7, 'null' => true])
+            ->addColumn('card_type', 'string', ['limit' => 50, 'null' => true])
+            ->addColumn('billing_address_id', 'biginteger', ['signed' => false, 'null' => true])
+            ->addColumn('is_default', 'boolean', ['null' => false, 'default' => false])
+            ->addColumn('status', 'enum', ['values' => ['active', 'expired', 'invalid'], 'null' => false, 'default' => 'active'])
+            ->addColumn('created_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addColumn('updated_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addIndex(['customer_id'], ['name' => 'idx_payment_customer'])
+            ->addIndex(['status'], ['name' => 'idx_payment_status'])
+            ->addForeignKey('customer_id', 'customer', 'id', ['delete' => 'CASCADE', 'update' => 'NO_ACTION'])
+            ->addForeignKey('billing_address_id', 'billing_addresses', 'id', ['delete' => 'SET_NULL', 'update' => 'NO_ACTION'])
+            ->create();
+        
+        // Add ON UPDATE trigger for updated_at manually
+        $this->execute("ALTER TABLE payment_methods MODIFY updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP");
+        
+        // Subscriptions table
+        $this->table('subscriptions', ['id' => false, 'primary_key' => ['id']])
+            ->addColumn('id', 'biginteger', ['identity' => true, 'signed' => false])
+            ->addColumn('uuid', 'string', ['limit' => 36, 'null' => false])
+            ->addColumn('customer_id', 'biginteger', ['signed' => false, 'null' => false])
+            ->addColumn('vendor_id', 'integer', ['null' => false])
+            ->addColumn('subscription_plan_id', 'biginteger', ['signed' => false, 'null' => false])
+            ->addColumn('payment_method_id', 'biginteger', ['signed' => false, 'null' => true])
+            ->addColumn('status', 'enum', ['values' => ['pending', 'active', 'past_due', 'canceled', 'expired'], 'null' => false, 'default' => 'pending'])
+            ->addColumn('next_billing_date', 'date', ['null' => false])
+            ->addColumn('last_billing_date', 'date', ['null' => true])
+            ->addColumn('billing_period_start', 'date', ['null' => false])
+            ->addColumn('billing_period_end', 'date', ['null' => true])
+            ->addColumn('cancellation_date', 'date', ['null' => true])
+            ->addColumn('cancellation_reason', 'string', ['limit' => 255, 'null' => true])
+            ->addColumn('quantity', 'integer', ['limit' => MysqlAdapter::INT_REGULAR, 'signed' => false, 'null' => false, 'default' => 1])
+            ->addColumn('current_price', 'decimal', ['precision' => 10, 'scale' => 2, 'null' => false])
+            ->addColumn('created_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addColumn('updated_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addColumn('metadata', 'json', ['null' => true])
+            ->addIndex(['uuid'], ['unique' => true, 'name' => 'uk_subscription_uuid'])
+            ->addIndex(['customer_id'], ['name' => 'idx_subscription_customer'])
+            ->addIndex(['vendor_id'], ['name' => 'idx_subscription_vendor'])
+            ->addIndex(['subscription_plan_id'], ['name' => 'idx_subscription_plan'])
+            ->addIndex(['payment_method_id'], ['name' => 'idx_subscription_payment'])
+            ->addIndex(['status'], ['name' => 'idx_subscription_status'])
+            ->addIndex(['next_billing_date'], ['name' => 'idx_subscription_billing'])
+            ->addForeignKey('customer_id', 'customer', 'id', ['delete' => 'CASCADE', 'update' => 'NO_ACTION'])
+            ->addForeignKey('subscription_plan_id', 'subscription_plans', 'id', ['delete' => 'RESTRICT', 'update' => 'NO_ACTION'])
+            ->addForeignKey('payment_method_id', 'payment_methods', 'id', ['delete' => 'SET_NULL', 'update' => 'NO_ACTION'])
+            ->create();
+        
+        // Add ON UPDATE trigger for updated_at manually
+        $this->execute("ALTER TABLE subscriptions MODIFY updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP");
+        
+        // Continue with other tables...
+        $this->createProcessingPlanTable();
+        $this->createBatchesTable();
+        $this->createBatchItemsTable();
+        $this->createTransactionsTable();
+        $this->createAuditLogsTable();
+        $this->createCommonQueryViews();
+        $this->addPartitioning();
+        $this->addPerformanceIndexes();
+        $this->createArchiveTables();
+        $this->createStoredProcedures();
+        $this->addComplianceTriggers();
+        $this->createScheduledEvents();
+        $this->createComplianceViews();
+    }
+
+    private function createProcessingPlanTable()
+    {
+        $this->table('processing_plans', ['id' => false, 'primary_key' => ['id']])
+            ->addColumn('id', 'biginteger', ['identity' => true, 'signed' => false])
+            ->addColumn('name', 'string', ['limit' => 100, 'null' => false])
+            ->addColumn('description', 'text', ['null' => true])
+            ->addColumn('frequency', 'enum', ['values' => ['daily', 'weekly', 'monthly', 'custom'], 'null' => false])
+            ->addColumn('is_active', 'boolean', ['null' => false, 'default' => true])
+            ->addColumn('created_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addColumn('updated_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addColumn('processing_window_start', 'time', ['null' => true])
+            ->addColumn('processing_window_end', 'time', ['null' => true])
+            ->addColumn('max_batch_size', 'integer', ['limit' => MysqlAdapter::INT_REGULAR, 'signed' => false, 'null' => false, 'default' => 1000])
+            ->addColumn('retry_strategy', 'json', ['null' => true])
+            ->addIndex(['is_active'], ['name' => 'idx_processing_active'])
+            ->create();
+            
+        // Add ON UPDATE trigger for updated_at manually
+        $this->execute("ALTER TABLE processing_plans MODIFY updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP");
+    }
+
+    private function createBatchesTable()
+    {
+        $this->table('batches', ['id' => false, 'primary_key' => ['id']])
+            ->addColumn('id', 'biginteger', ['identity' => true, 'signed' => false])
+            ->addColumn('uuid', 'string', ['limit' => 36, 'null' => false])
+            ->addColumn('processing_plan_id', 'biginteger', ['signed' => false, 'null' => false])
+            ->addColumn('status', 'enum', ['values' => ['pending', 'processing', 'completed', 'failed', 'canceled'], 'null' => false, 'default' => 'pending'])
+            ->addColumn('created_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addColumn('updated_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addColumn('scheduled_time', 'timestamp', ['null' => false])
+            ->addColumn('started_at', 'timestamp', ['null' => true])
+            ->addColumn('completed_at', 'timestamp', ['null' => true])
+            ->addColumn('total_items', 'integer', ['limit' => MysqlAdapter::INT_REGULAR, 'signed' => false, 'null' => false, 'default' => 0])
+            ->addColumn('processed_items', 'integer', ['limit' => MysqlAdapter::INT_REGULAR, 'signed' => false, 'null' => false, 'default' => 0])
+            ->addColumn('success_items', 'integer', ['limit' => MysqlAdapter::INT_REGULAR, 'signed' => false, 'null' => false, 'default' => 0])
+            ->addColumn('failed_items', 'integer', ['limit' => MysqlAdapter::INT_REGULAR, 'signed' => false, 'null' => false, 'default' => 0])
+            ->addColumn('error_message', 'text', ['null' => true])
+            ->addColumn('metadata', 'json', ['null' => true])
+            ->addIndex(['uuid'], ['unique' => true, 'name' => 'uk_batch_uuid'])
+            ->addIndex(['status'], ['name' => 'idx_batch_status'])
+            ->addIndex(['scheduled_time'], ['name' => 'idx_batch_scheduled'])
+            ->addIndex(['processing_plan_id'], ['name' => 'idx_batch_processing_plan'])
+            ->addForeignKey('processing_plan_id', 'processing_plans', 'id', ['delete' => 'RESTRICT', 'update' => 'NO_ACTION'])
+            ->create();
+            
+        // Add ON UPDATE trigger for updated_at manually
+        $this->execute("ALTER TABLE batches MODIFY updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP");
+    }
+
+    private function createBatchItemsTable()
+    {
+        $this->table('batch_items', ['id' => false, 'primary_key' => ['id']])
+            ->addColumn('id', 'biginteger', ['identity' => true, 'signed' => false])
+            ->addColumn('batch_id', 'biginteger', ['signed' => false, 'null' => false])
+            ->addColumn('subscription_id', 'biginteger', ['signed' => false, 'null' => false])
+            ->addColumn('status', 'enum', ['values' => ['pending', 'processing', 'success', 'failed', 'skipped'], 'null' => false, 'default' => 'pending'])
+            ->addColumn('created_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addColumn('updated_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addColumn('processed_at', 'timestamp', ['null' => true])
+            ->addColumn('retry_count', 'integer', ['limit' => MysqlAdapter::INT_REGULAR, 'signed' => false, 'null' => false, 'default' => 0])
+            ->addColumn('error_message', 'text', ['null' => true])
+            ->addColumn('result_data', 'json', ['null' => true])
+            ->addIndex(['batch_id', 'subscription_id'], ['unique' => true, 'name' => 'uk_batch_subscription'])
+            ->addIndex(['batch_id'], ['name' => 'idx_batch_item_batch'])
+            ->addIndex(['subscription_id'], ['name' => 'idx_batch_item_subscription'])
+            ->addIndex(['status'], ['name' => 'idx_batch_item_status'])
+            ->addForeignKey('batch_id', 'batches', 'id', ['delete' => 'CASCADE', 'update' => 'NO_ACTION'])
+            ->addForeignKey('subscription_id', 'subscriptions', 'id', ['delete' => 'CASCADE', 'update' => 'NO_ACTION'])
+            ->create();
+            
+        // Add ON UPDATE trigger for updated_at manually
+        $this->execute("ALTER TABLE batch_items MODIFY updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP");
+    }
+
+    private function createTransactionsTable()
+    {
+        $this->table('transactions', ['id' => false, 'primary_key' => ['id']])
+            ->addColumn('id', 'biginteger', ['identity' => true, 'signed' => false])
+            ->addColumn('uuid', 'string', ['limit' => 36, 'null' => false])
+            ->addColumn('subscription_id', 'biginteger', ['signed' => false, 'null' => false])
+            ->addColumn('batch_item_id', 'biginteger', ['signed' => false, 'null' => true])
+            ->addColumn('amount', 'decimal', ['precision' => 10, 'scale' => 2, 'null' => false])
+            ->addColumn('currency', 'string', ['limit' => 3, 'null' => false, 'default' => 'USD'])
+            ->addColumn('status', 'enum', ['values' => ['pending', 'processing', 'success', 'failed', 'refunded', 'partially_refunded'], 'null' => false, 'default' => 'pending'])
+            ->addColumn('transaction_type', 'enum', ['values' => ['charge', 'refund', 'credit'], 'null' => false, 'default' => 'charge'])
+            ->addColumn('payment_processor', 'string', ['limit' => 50, 'null' => false])
+            ->addColumn('processor_transaction_id', 'string', ['limit' => 255, 'null' => true])
+            ->addColumn('processor_response_code', 'string', ['limit' => 50, 'null' => true])
+            ->addColumn('processor_response_message', 'text', ['null' => true])
+            ->addColumn('created_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addColumn('updated_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP', 'update' => 'CURRENT_TIMESTAMP'])
+            ->addColumn('completed_at', 'timestamp', ['null' => true])
+            ->addColumn('metadata', 'json', ['null' => true])
+            ->addIndex(['uuid'], ['unique' => true, 'name' => 'uk_transaction_uuid'])
+            ->addIndex(['subscription_id'], ['name' => 'idx_transaction_subscription'])
+            ->addIndex(['batch_item_id'], ['name' => 'idx_transaction_batch_item'])
+            ->addIndex(['status'], ['name' => 'idx_transaction_status'])
+            ->addIndex(['created_at'], ['name' => 'idx_transaction_created'])
+            ->addIndex(['transaction_type'], ['name' => 'idx_transaction_type'])
+            ->addForeignKey('subscription_id', 'subscriptions', 'id', ['delete' => 'CASCADE', 'update' => 'NO_ACTION'])
+            ->addForeignKey('batch_item_id', 'batch_items', 'id', ['delete' => 'SET_NULL', 'update' => 'NO_ACTION'])
+            ->create();
+    }
+
+    private function createAuditLogsTable()
+    {
+        $this->table('audit_logs', ['id' => false, 'primary_key' => ['id']])
+            ->addColumn('id', 'biginteger', ['identity' => true, 'signed' => false])
+            ->addColumn('entity_type', 'string', ['limit' => 50, 'null' => false])
+            ->addColumn('entity_id', 'string', ['limit' => 36, 'null' => false])
+            ->addColumn('user_id', 'string', ['limit' => 36, 'null' => true])
+            ->addColumn('action', 'string', ['limit' => 50, 'null' => false])
+            ->addColumn('old_values', 'json', ['null' => true])
+            ->addColumn('new_values', 'json', ['null' => true])
+            ->addColumn('ip_address', 'string', ['limit' => 45, 'null' => true])
+            ->addColumn('created_at', 'timestamp', ['null' => false, 'default' => 'CURRENT_TIMESTAMP'])
+            ->addIndex(['entity_type', 'entity_id'], ['name' => 'idx_audit_entity'])
+            ->addIndex(['user_id'], ['name' => 'idx_audit_user'])
+            ->addIndex(['action'], ['name' => 'idx_audit_action'])
+            ->addIndex(['created_at'], ['name' => 'idx_audit_created'])
+            ->create();
+    }
+
+    private function createCommonQueryViews()
+    {
+        // Create view for subscriptions due in next 24 hours
+        $this->execute("
+            CREATE VIEW vw_subscriptions_due_next_24h AS
+            SELECT s.* 
+            FROM subscriptions s
+            WHERE s.status = 'active' 
+              AND s.next_billing_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+        ");
+        
+        // Create view for customer subscription summary
+        $this->execute("
+            CREATE VIEW vw_customer_subscription_summary AS
+            SELECT 
+                c.id AS customer_id,
+                c.email,
+                c.first_name,
+                c.last_name,
+                COUNT(s.id) AS total_subscriptions,
+                SUM(CASE WHEN s.status = 'active' THEN 1 ELSE 0 END) AS active_subscriptions,
+                SUM(CASE WHEN s.status = 'active' THEN s.current_price ELSE 0 END) AS monthly_recurring_revenue
+            FROM customer c
+            LEFT JOIN subscriptions s ON c.id = s.customer_id
+            GROUP BY c.id, c.email, c.first_name, c.last_name
+        ");
+    }
+
+    private function addPerformanceIndexes()
+    {
+        // Add fulltext search for customer names
+        $this->table('customer')
+            ->addIndex(['first_name', 'last_name'], ['type' => 'fulltext', 'name' => 'ft_customer_name'])
+            ->save();
+            
+        // Add index for subscription date ranges
+        $this->table('subscriptions')
+            ->addIndex(['next_billing_date', 'status'], ['name' => 'idx_subscription_date_range'])
+            ->addIndex(['updated_at'], ['name' => 'idx_subscription_updated'])
+            ->save();
+            
+        // Add composite index for batch items
+        $this->table('batch_items')
+            ->addIndex(['batch_id', 'status', 'subscription_id'], ['name' => 'idx_batch_item_composite'])
+            ->save();
+            
+        // Add index for transaction reporting
+        $this->table('transactions')
+            ->addIndex(['created_at', 'amount', 'status'], ['name' => 'idx_transaction_date_amount'])
+            ->save();
+    }
+
+    private function createArchiveTables()
+    {
+        // Create archive tables for transactions and batches
+        $this->execute('CREATE TABLE transactions_archive LIKE transactions');
+        $this->execute('ALTER TABLE transactions_archive REMOVE PARTITIONING');
+        
+        $this->execute('CREATE TABLE batches_archive LIKE batches');
+        $this->execute('ALTER TABLE batches_archive REMOVE PARTITIONING');
+    }
+
+    private function addPartitioning()
+    {
+        // Add partitioning to transactions table
+        $this->execute("
+            ALTER TABLE transactions PARTITION BY RANGE (YEAR(created_at) * 100 + MONTH(created_at)) (
+                PARTITION p_transactions_current VALUES LESS THAN (YEAR(CURDATE()) * 100 + MONTH(CURDATE()) + 1),
+                PARTITION p_transactions_future VALUES LESS THAN MAXVALUE
+            )
+        ");
+        
+        // Add partitioning to batches table
+        $this->execute("
+            ALTER TABLE batches PARTITION BY RANGE (UNIX_TIMESTAMP(scheduled_time)) (
+                PARTITION p_batches_current VALUES LESS THAN (UNIX_TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY))),
+                PARTITION p_batches_future VALUES LESS THAN MAXVALUE
+            )
+        ");
+    }
+
+    private function createStoredProcedures()
+    {
+        // Transaction partition maintenance procedure
+        $this->execute("
+            CREATE PROCEDURE sp_maintain_transaction_partitions()
+            BEGIN
+                DECLARE current_year INT;
+                DECLARE current_month INT;
+                DECLARE next_partition_value INT;
+                DECLARE partition_exists INT;
+                
+                -- Calculate current year-month and next partition value
+                SET current_year = YEAR(CURDATE());
+                SET current_month = MONTH(CURDATE());
+                SET next_partition_value = (current_year * 100 + current_month + 1);
+                
+                -- Check if the next month partition already exists
+                SELECT COUNT(*) INTO partition_exists
+                FROM information_schema.partitions 
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'transactions'
+                  AND partition_name = CONCAT('p_transactions_', next_partition_value);
+                
+                -- If next month partition doesn't exist, create it
+                IF partition_exists = 0 THEN
+                    SET @sql = CONCAT('ALTER TABLE transactions REORGANIZE PARTITION p_transactions_future INTO (
+                        PARTITION p_transactions_', next_partition_value, ' VALUES LESS THAN (', next_partition_value + 1, '),
+                        PARTITION p_transactions_future VALUES LESS THAN MAXVALUE
+                    )');
+                    PREPARE stmt FROM @sql;
+                    EXECUTE stmt;
+                    DEALLOCATE PREPARE stmt;
+                END IF;
+                
+                -- Remove partitions older than 24 months (if needed)
+                SET @old_partition_date = current_year * 100 + current_month - 24;
+                
+                SELECT COUNT(*) INTO partition_exists
+                FROM information_schema.partitions 
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'transactions'
+                  AND partition_name = CONCAT('p_transactions_', @old_partition_date);
+                
+                IF partition_exists > 0 THEN
+                    SET @sql = CONCAT('ALTER TABLE transactions DROP PARTITION p_transactions_', @old_partition_date);
+                    PREPARE stmt FROM @sql;
+                    EXECUTE stmt;
+                    DEALLOCATE PREPARE stmt;
+                END IF;
+            END
+        ");
+
+        // Batch partition maintenance procedure
+        $this->execute("
+            CREATE PROCEDURE sp_maintain_batch_partitions()
+            BEGIN
+                DECLARE tomorrow_unix BIGINT;
+                DECLARE next_week_unix BIGINT;
+                DECLARE partition_exists INT;
+                
+                -- Calculate unix timestamps for partition boundaries
+                SET tomorrow_unix = UNIX_TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY));
+                SET next_week_unix = UNIX_TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 DAY));
+                
+                -- Check if the next week partition already exists
+                SELECT COUNT(*) INTO partition_exists
+                FROM information_schema.partitions 
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'batches'
+                  AND partition_name = CONCAT('p_batches_nextweek');
+                
+                -- If next week partition doesn't exist, create it
+                IF partition_exists = 0 THEN
+                    SET @sql = CONCAT('ALTER TABLE batches REORGANIZE PARTITION p_batches_future INTO (
+                        PARTITION p_batches_nextweek VALUES LESS THAN (', next_week_unix, '),
+                        PARTITION p_batches_future VALUES LESS THAN MAXVALUE
+                    )');
+                    PREPARE stmt FROM @sql;
+                    EXECUTE stmt;
+                    DEALLOCATE PREPARE stmt;
+                END IF;
+                
+                -- Remove partitions older than 3 months
+                SET @old_partition_date = UNIX_TIMESTAMP(DATE_SUB(CURDATE(), INTERVAL 3 MONTH));
+                
+                SELECT COUNT(*) INTO partition_exists
+                FROM information_schema.partitions 
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'batches'
+                  AND partition_name = CONCAT('p_batches_old');
+                
+                IF partition_exists > 0 THEN
+                    SET @sql = CONCAT('ALTER TABLE batches DROP PARTITION p_batches_old');
+                    PREPARE stmt FROM @sql;
+                    EXECUTE stmt;
+                    DEALLOCATE PREPARE stmt;
+                END IF;
+            END
+        ");
+
+        // Create archiving procedures
+        $this->execute("
+            CREATE PROCEDURE sp_archive_transactions(IN months_to_keep INT)
+            BEGIN
+                DECLARE archive_date DATE;
+                SET archive_date = DATE_SUB(CURDATE(), INTERVAL months_to_keep MONTH);
+                
+                -- Insert old records into archive
+                INSERT INTO transactions_archive
+                SELECT * FROM transactions
+                WHERE created_at < archive_date;
+                
+                -- Delete archived records from main table
+                DELETE FROM transactions 
+                WHERE created_at < archive_date;
+            END
+        ");
+
+        $this->execute("
+            CREATE PROCEDURE sp_archive_batches(IN months_to_keep INT)
+            BEGIN
+                DECLARE archive_date DATE;
+                SET archive_date = DATE_SUB(CURDATE(), INTERVAL months_to_keep MONTH);
+                
+                -- Insert old records into archive
+                INSERT INTO batches_archive
+                SELECT * FROM batches
+                WHERE created_at < archive_date;
+                
+                -- Delete archived records from main table
+                DELETE FROM batches 
+                WHERE created_at < archive_date;
+            END
+        ");
+
+        // Data masking function for PCI compliance
+        $this->execute("
+            CREATE FUNCTION fn_mask_pii(input_text VARCHAR(255), mask_char CHAR(1), visible_chars INT)
+            RETURNS VARCHAR(255)
+            DETERMINISTIC
+            BEGIN
+                DECLARE result VARCHAR(255);
+                DECLARE text_length INT;
+                
+                IF input_text IS NULL THEN
+                    RETURN NULL;
+                END IF;
+                
+                SET text_length = CHAR_LENGTH(input_text);
+                
+                IF text_length <= visible_chars THEN
+                    RETURN input_text;
+                END IF;
+                
+                SET result = CONCAT(
+                    LEFT(input_text, visible_chars),
+                    REPEAT(mask_char, text_length - visible_chars)
+                );
+                
+                RETURN result;
+            END
+        ");
+
+        // GDPR data export procedure
+        $this->execute("
+            CREATE PROCEDURE sp_export_customer_data(IN customer_uuid VARCHAR(36))
+            BEGIN
+                -- Declare variables to hold customer ID
+                DECLARE customer_id BIGINT UNSIGNED;
+                
+                -- Get customer ID from UUID
+                SELECT id INTO customer_id
+                FROM customer
+                WHERE uuid = customer_uuid;
+                
+                -- Return customer personal data
+                SELECT
+                    'customer_data' AS data_section,
+                    c.uuid,
+                    c.email,
+                    c.first_name,
+                    c.last_name,
+                    c.phone,
+                    c.created_at,
+                    c.updated_at,
+                    c.gdpr_consent,
+                    c.marketing_consent,
+                    c.consent_date
+                FROM customer c
+                WHERE c.id = customer_id;
+                
+                -- Return customer billing addresses
+                SELECT
+                    'billing_addresses' AS data_section,
+                    ba.id,
+                    ba.address_line1,
+                    ba.address_line2,
+                    ba.city,
+                    ba.state,
+                    ba.postal_code,
+                    ba.country,
+                    ba.is_default,
+                    ba.created_at,
+                    ba.updated_at
+                FROM billing_addresses ba
+                WHERE ba.customer_id = customer_id;
+                
+                -- Return masked payment methods
+                SELECT
+                    'payment_methods' AS data_section,
+                    pm.id,
+                    pm.payment_type,
+                    pm.last_four,
+                    pm.expiry_date,
+                    pm.card_type,
+                    pm.is_default,
+                    pm.status,
+                    pm.created_at,
+                    pm.updated_at
+                FROM payment_methods pm
+                WHERE pm.customer_id = customer_id;
+                
+                -- Return subscriptions
+                SELECT
+                    'subscriptions' AS data_section,
+                    s.uuid,
+                    s.status,
+                    s.billing_period_start,
+                    s.next_billing_date,
+                    s.last_billing_date,
+                    s.billing_period_end,
+                    s.cancellation_date,
+                    s.cancellation_reason,
+                    s.quantity,
+                    s.current_price,
+                    s.created_at,
+                    s.updated_at
+                FROM subscriptions s
+                WHERE s.customer_id = customer_id;
+                
+                -- Return transaction history (without sensitive data)
+                SELECT
+                    'transactions' AS data_section,
+                    t.uuid,
+                    t.amount,
+                    t.currency,
+                    t.status,
+                    t.transaction_type,
+                    t.created_at,
+                    t.updated_at,
+                    t.completed_at
+                FROM transactions t
+                JOIN subscriptions s ON t.subscription_id = s.id
+                WHERE s.customer_id = customer_id;
+            END
+        ");
+
+        // Add more stored procedures and functions
+        $this->createGdprForgetCustomerProcedure();
+        $this->createPciPlaceholderFunctions();
+    }
+
+    private function createGdprForgetCustomerProcedure()
+    {
+        $this->execute("
+            CREATE PROCEDURE sp_gdpr_forget_customer(IN customer_uuid VARCHAR(36))
+            BEGIN
+                -- Declare variables
+                DECLARE customer_id BIGINT UNSIGNED;
+                
+                -- Get customer ID from UUID
+                SELECT id INTO customer_id
+                FROM customer
+                WHERE uuid = customer_uuid;
+                
+                -- Create audit trail before deletion
+                INSERT INTO audit_logs (entity_type, entity_id, action, old_values, created_at)
+                SELECT 
+                    'customer', 
+                    customer_uuid, 
+                    'gdpr_forget_requested', 
+                    JSON_OBJECT(
+                        'id', id,
+                        'uuid', uuid,
+                        'email', email,
+                        'request_date', CURRENT_TIMESTAMP
+                    ),
+                    CURRENT_TIMESTAMP
+                FROM customer
+                WHERE id = customer_id;
+                
+                -- Update customer record to anonymize PII
+                UPDATE customer
+                SET 
+                    email = CONCAT('deleted_', UUID()),
+                    first_name = NULL,
+                    last_name = NULL,
+                    phone = NULL,
+                    status = 'deleted',
+                    gdpr_consent = FALSE,
+                    marketing_consent = FALSE
+                WHERE id = customer_id;
+                
+                -- Anonymize billing addresses
+                UPDATE billing_addresses
+                SET 
+                    address_line1 = 'DELETED',
+                    address_line2 = NULL,
+                    city = 'DELETED',
+                    state = 'DELETED',
+                    postal_code = 'DELETED'
+                WHERE customer_id = customer_id;
+                
+                -- Anonymize payment methods (mark as invalid but keep for transaction history)
+                UPDATE payment_methods
+                SET 
+                    payment_token = 'DELETED',
+                    last_four = NULL,
+                    expiry_date = NULL,
+                    card_type = NULL,
+                    status = 'invalid'
+                WHERE customer_id = customer_id;
+                
+                -- Log completion
+                INSERT INTO audit_logs (entity_type, entity_id, action, new_values, created_at)
+                VALUES (
+                    'customer', 
+                    customer_uuid, 
+                    'gdpr_forget_completed', 
+                    JSON_OBJECT('completion_date', CURRENT_TIMESTAMP),
+                    CURRENT_TIMESTAMP
+                );
+            END
+        ");
+    }
+
+    private function createPciPlaceholderFunctions()
+    {
+        $this->execute("
+            CREATE FUNCTION fn_encrypt_placeholder(input_text VARCHAR(255)) 
+            RETURNS VARCHAR(255)
+            DETERMINISTIC
+            BEGIN
+                -- Note: In a real implementation, this would use proper encryption
+                -- This is a placeholder to demonstrate the concept
+                RETURN CONCAT('ENCRYPTED:', input_text);
+            END
+        ");
+
+        $this->execute("
+            CREATE FUNCTION fn_decrypt_placeholder(encrypted_text VARCHAR(255)) 
+            RETURNS VARCHAR(255)
+            DETERMINISTIC
+            BEGIN
+                -- Note: In a real implementation, this would use proper decryption
+                -- This is a placeholder to demonstrate the concept
+                IF LEFT(encrypted_text, 10) = 'ENCRYPTED:' THEN
+                    RETURN SUBSTRING(encrypted_text, 11);
+                ELSE
+                    RETURN encrypted_text;
+                END IF;
+            END
+        ");
+    }
+
+    private function addComplianceTriggers()
+    {
+        // Add GDPR compliance trigger for customer deletion
+        $this->execute("
+            CREATE TRIGGER trg_customers_gdpr_delete
+            BEFORE DELETE ON customer
+            FOR EACH ROW
+            BEGIN
+                INSERT INTO audit_logs (entity_type, entity_id, action, old_values, created_at)
+                VALUES ('customer', OLD.uuid, 'gdpr_delete', 
+                    JSON_OBJECT(
+                        'id', OLD.id,
+                        'uuid', OLD.uuid,
+                        'email', OLD.email,
+                        'deletion_date', CURRENT_TIMESTAMP
+                    ),
+                    CURRENT_TIMESTAMP
+                );
+            END
+        ");
+
+        // Add PCI compliance audit trigger for payment methods
+        $this->execute("
+            CREATE TRIGGER trg_payment_methods_audit
+            AFTER UPDATE ON payment_methods
+            FOR EACH ROW
+            BEGIN
+                INSERT INTO audit_logs (entity_type, entity_id, action, old_values, new_values, created_at)
+                VALUES (
+                    'payment_methods', 
+                    CONCAT(NEW.id), 
+                    'update', 
+                    JSON_OBJECT(
+                        'payment_type', OLD.payment_type,
+                        'is_default', OLD.is_default,
+                        'status', OLD.status
+                    ),
+                    JSON_OBJECT(
+                        'payment_type', NEW.payment_type,
+                        'is_default', NEW.is_default,
+                        'status', NEW.status
+                    ),
+                    CURRENT_TIMESTAMP
+                );
+            END
+        ");
+
+        // Add transaction audit trigger
+        $this->execute("
+            CREATE TRIGGER trg_transactions_audit
+            AFTER UPDATE ON transactions
+            FOR EACH ROW
+            BEGIN
+                INSERT INTO audit_logs (entity_type, entity_id, action, old_values, new_values, created_at)
+                VALUES (
+                    'transactions', 
+                    NEW.uuid, 
+                    'update', 
+                    JSON_OBJECT(
+                        'status', OLD.status,
+                        'amount', OLD.amount
+                    ),
+                    JSON_OBJECT(
+                        'status', NEW.status,
+                        'amount', NEW.amount
+                    ),
+                    CURRENT_TIMESTAMP
+                );
+            END
+        ");
+    }
+
+    private function createScheduledEvents()
+    {
+        // Create event to maintain partitions automatically
+        $this->execute("
+            CREATE EVENT evt_maintain_partitions
+            ON SCHEDULE EVERY 1 DAY
+            STARTS CURRENT_TIMESTAMP + INTERVAL 1 HOUR
+            DO
+            BEGIN
+                CALL sp_maintain_transaction_partitions();
+                CALL sp_maintain_batch_partitions();
+            END
+        ");
+    }
+
+    private function createComplianceViews()
+    {
+        // Create masked view for customer PII data
+        $this->execute("
+            CREATE VIEW vw_customer_masked AS
+            SELECT 
+                id,
+                uuid,
+                fn_mask_pii(email, '*', 3) AS email,
+                fn_mask_pii(first_name, '*', 1) AS first_name,
+                fn_mask_pii(last_name, '*', 1) AS last_name,
+                fn_mask_pii(phone, '*', 4) AS phone,
+                created_at,
+                updated_at,
+                gdpr_consent,
+                marketing_consent,
+                consent_date,
+                status
+            FROM customer
+        ");
+
+        // Create masked view for payment methods
+        $this->execute("
+            CREATE VIEW vw_payment_methods_masked AS
+            SELECT 
+                pm.id,
+                pm.customer_id,
+                pm.payment_type,
+                '************' AS payment_token,
+                pm.last_four,
+                pm.expiry_date,
+                pm.card_type,
+                pm.billing_address_id,
+                pm.is_default,
+                pm.status,
+                pm.created_at,
+                pm.updated_at
+            FROM payment_methods pm
+        ");
+
+        // Create compliance reporting views
+        $this->execute("
+            CREATE VIEW vw_gdpr_consent_status AS
+            SELECT
+                COUNT(*) AS total_customers,
+                SUM(CASE WHEN gdpr_consent = TRUE THEN 1 ELSE 0 END) AS gdpr_consent_granted,
+                SUM(CASE WHEN marketing_consent = TRUE THEN 1 ELSE 0 END) AS marketing_consent_granted,
+                SUM(CASE WHEN consent_date IS NOT NULL THEN 1 ELSE 0 END) AS consent_date_recorded
+            FROM customer
+            WHERE status = 'active'
+        ");
+
+        $this->execute("
+            CREATE VIEW vw_pci_sensitive_data_access AS
+            SELECT
+                al.id,
+                al.entity_type,
+                al.entity_id,
+                al.user_id,
+                al.action,
+                al.ip_address,
+                al.created_at
+            FROM audit_logs al
+            WHERE al.entity_type IN ('payment_methods', 'transactions', 'customer')
+              AND al.action IN ('view', 'export', 'update', 'delete')
+            ORDER BY al.created_at DESC
+        ");
+    }
+
+    private function integrateExistingDatabase()
+    {
+        // Check if customer table exists
+        $hasCustomerTable = $this->hasTable('customer');
+
+        if ($hasCustomerTable) {
+            // Add UUID column and modify existing columns' types where necessary
+            $table = $this->table('customer');
+            
+            if (!$table->hasColumn('uuid')) {
+                $table->addColumn('uuid', 'string', ['limit' => 36, 'after' => 'id'])
+                    ->save();
+                
+                // Update all existing customers to have UUID values
+                $this->execute("UPDATE `customer` SET `uuid` = UUID() WHERE `uuid` IS NULL");
+                
+                // Make UUID NOT NULL and create unique index
+                $table->changeColumn('uuid', 'string', ['limit' => 36, 'null' => false])
+                    ->addIndex(['uuid'], ['unique' => true, 'name' => 'uk_customer_uuid'])
+                    ->save();
+            }
+            
+            // Modify existing column types for consistency if needed
+            if ($table->hasColumn('email')) {
+                $table->changeColumn('email', 'string', ['limit' => 255, 'null' => false])
+                    ->save();
+            }
+            
+            if ($table->hasColumn('first_name')) {
+                $table->changeColumn('first_name', 'string', ['limit' => 100, 'null' => false])
+                    ->save();
+            }
+            
+            if ($table->hasColumn('last_name')) {
+                $table->changeColumn('last_name', 'string', ['limit' => 100, 'null' => false])
+                    ->save();
+            }
+            
+            // Add subscription management and GDPR compliance columns
+            if (!$table->hasColumn('gdpr_consent')) {
+                $table->addColumn('gdpr_consent', 'boolean', ['null' => false, 'default' => false])
+                    ->save();
+            }
+            
+            if (!$table->hasColumn('marketing_consent')) {
+                $table->addColumn('marketing_consent', 'boolean', ['null' => false, 'default' => false])
+                    ->save();
+            }
+            
+            if (!$table->hasColumn('consent_date')) {
+                $table->addColumn('consent_date', 'timestamp', ['null' => true, 'default' => null])
+                    ->save();
+            }
+            
+            if (!$table->hasColumn('fivserv_security_token')) {
+                $table->addColumn('fivserv_security_token', 'string', [
+                    'limit' => 255, 
+                    'null' => true, 
+                    'comment' => 'Token used for authenticating with Fiserv payment processing service'
+                ])
+                ->save();
+            }
+            
+            // Handle status column conversion
+            if ($table->hasColumn('status') && $this->adapter->fetchRow("SELECT DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'customer' AND COLUMN_NAME = 'status'")[0] != 'enum') {
+                // Add temporary status column
+                if (!$table->hasColumn('status_enum')) {
+                    $table->addColumn('status_enum', 'enum', [
+                        'values' => ['active', 'suspended', 'deleted'], 
+                        'default' => 'active', 
+                        'null' => false
+                    ])
+                    ->save();
+                    
+                    // Convert status values
+                    $this->execute("
+                        UPDATE `customer` 
+                        SET `status_enum` = CASE 
+                            WHEN `status` = 1 THEN 'active' 
+                            ELSE 'suspended' 
+                        END
+                    ");
+                    
+                    // Drop old status column and rename new one
+                    $table->removeColumn('status')
+                        ->save();
+                    
+                    $table->renameColumn('status_enum', 'status')
+                        ->save();
+                }
+            }
+            
+            // Add appropriate indexes for performance
+                } catch (\Exception $e) {
+                    // Index likely already exists - ignore the error
+                }
+            }
+            
+            if (!$table->hasIndex('idx_customer_status')) {
+                $table->addIndex(['status'], ['name' => 'idx_customer_status'])
+                    ->save();
+            }
+            
+            if (!$table->hasIndex('idx_customer_fivserv_token')) {
+                $table->addIndex(['fivserv_security_token'], ['name' => 'idx_customer_fivserv_token'])
+                    ->save();
+            }
+            
+            // Rename timestamp columns to match the subscription schema naming
+            if ($table->hasColumn('timestamp') && !$table->hasColumn('created_at')) {
+                // Use direct SQL with explicit syntax that works across MySQL versions
+                $this->execute("ALTER TABLE `customer` CHANGE `timestamp` `created_at` TIMESTAMP NULL");
+                $this->execute("ALTER TABLE `customer` ALTER `created_at` SET DEFAULT CURRENT_TIMESTAMP");
+                $this->execute("UPDATE `customer` SET `created_at` = CURRENT_TIMESTAMP WHERE `created_at` IS NULL");
+                $this->execute("ALTER TABLE `customer` MODIFY `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP");
+            }
+            
+            if ($table->hasColumn('lastmod') && !$table->hasColumn('updated_at')) {
+                // Use direct SQL with explicit syntax that works across MySQL versions
+                $this->execute("ALTER TABLE `customer` CHANGE `lastmod` `updated_at` TIMESTAMP NULL");
+                $this->execute("ALTER TABLE `customer` ALTER `updated_at` SET DEFAULT CURRENT_TIMESTAMP");
+                $this->execute("UPDATE `customer` SET `updated_at` = CURRENT_TIMESTAMP WHERE `updated_at` IS NULL");
+                $this->execute("ALTER TABLE `customer` MODIFY `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP");
+            }
+            
+            // Add a comment to the table
+            $this->execute("ALTER TABLE `customer` COMMENT = 'Customer table enhanced for subscription management with GDPR compliance'");
+        }
+    }
+
+    public function down()
+    {
+        // Drop tables in reverse order to handle foreign key constraints
+        $this->table('batch_items')->drop()->save();
+        $this->table('transactions')->drop()->save();
+        $this->table('batches')->drop()->save();
+        $this->table('processing_plans')->drop()->save();
+        $this->table('subscriptions')->drop()->save();
+        $this->table('payment_methods')->drop()->save();
+        $this->table('billing_addresses')->drop()->save();
+        $this->table('subscription_plans')->drop()->save();
+        
+        // Drop views
+        $this->execute('DROP VIEW IF EXISTS vw_subscriptions_due_next_24h');
+        $this->execute('DROP VIEW IF EXISTS vw_customer_subscription_summary');
+        $this->execute('DROP VIEW IF EXISTS vw_customer_masked');
+        $this->execute('DROP VIEW IF EXISTS vw_payment_methods_masked');
+        $this->execute('DROP VIEW IF EXISTS vw_gdpr_consent_status');
+        $this->execute('DROP VIEW IF EXISTS vw_pci_sensitive_data_access');
+        
+        // Drop scheduled events
+        $this->execute('DROP EVENT IF EXISTS evt_maintain_partitions');
+        
+        // Drop triggers
+        $this->execute('DROP TRIGGER IF EXISTS trg_customers_gdpr_delete');
+        $this->execute('DROP TRIGGER IF EXISTS trg_payment_methods_audit');
+        $this->execute('DROP TRIGGER IF EXISTS trg_transactions_audit');
+        
+        // Drop stored procedures and functions
+        $this->execute('DROP PROCEDURE IF EXISTS sp_maintain_transaction_partitions');
+        $this->execute('DROP PROCEDURE IF EXISTS sp_maintain_batch_partitions');
+        $this->execute('DROP PROCEDURE IF EXISTS sp_archive_transactions');
+        $this->execute('DROP PROCEDURE IF EXISTS sp_archive_batches');
+        $this->execute('DROP PROCEDURE IF EXISTS sp_export_customer_data');
+        $this->execute('DROP PROCEDURE IF EXISTS sp_gdpr_forget_customer');
+        $this->execute('DROP FUNCTION IF EXISTS fn_mask_pii');
+        $this->execute('DROP FUNCTION IF EXISTS fn_encrypt_placeholder');
+        $this->execute('DROP FUNCTION IF EXISTS fn_decrypt_placeholder');
+        
+        // Remove additional columns from existing customer table
+        $this->table('customer')
+            ->removeColumn('uuid')
+            ->removeColumn('gdpr_consent')
+            ->removeColumn('marketing_consent')
+            ->removeColumn('consent_date')
+            ->removeColumn('fivserv_security_token')
+            ->removeIndex('uk_customer_uuid')
+            ->removeIndex('uk_customer_email')
+            ->removeIndex('idx_customer_status')
+            ->removeIndex('idx_customer_fivserv_token')
+            ->save();
+            
+        // Revert column name changes on customer table
+        $this->table('customer')
+            ->renameColumn('created_at', 'timestamp')
+            ->renameColumn('updated_at', 'lastmod')
+            ->save();
+            
+        // Revert status enum to boolean
+        $this->table('customer')
+            ->addColumn('status_bool', 'boolean', ['null' => false, 'default' => true])
+            ->save();
+            
+        $this->execute("UPDATE `customer` SET `status_bool` = CASE WHEN `status` = 'active' THEN TRUE ELSE FALSE END");
+        
+        $this->table('customer')
+            ->removeColumn('status')
+            ->renameColumn('status_bool', 'status')
+            ->save();
+    }
+
+    // Other private methods will be added in subsequent migrations
+} 

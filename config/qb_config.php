@@ -1,0 +1,15 @@
+<?php
+return array(
+    'authorizationRequestUrl' => 'https://appcenter.intuit.com/connect/oauth2',
+    'tokenEndPointUrl' => 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer',
+    'client_id' => 'ABIp4MbSV8IOU6KdDBbZGCo5UJisc9SHQ1qJVAflxNN7M5m8rW',
+    'client_secret' => 'HZV09XxebK5qru9ti5jrcXPoJgmOH5zenhav7WYu',
+    'oauth_scope' => 'com.intuit.quickbooks.accounting openid profile email phone address',
+    'oauth_redirect_uri' => 'https://portal.olapay.us/api/qb_authorize_callback.php',
+    'oauth_redirect_uri_staging' => 'https://portalstg.olapay.us/api/qb_authorize_callback.php',
+    'baseApiUrl' => 'https://sandbox-quickbooks.api.intuit.com/v3/company',
+    'minorVersion' => '?minorversion=73',
+    'companyInfoSuffix' => '/companyinfo',
+    'salesReceiptCreateSuffix' => '/salesreceipt',
+    'batchSuffix' => '/batch'
+);

@@ -1,0 +1,591 @@
+<?php
+ini_set('display_errors', 1);
+error_reporting(E_ALL);
+set_time_limit(0); // Allow script to run for a long time
+
+include_once __DIR__ . "/library/utils.php";
+
+function getDeliveryServiceCode($service)
+{
+  $services = [
+    "SELF-PICKUP" => 0,
+    "DOORDASH" => 1,
+    "UBER" => 2,
+    "GRUBHUB" => 3
+  ];
+
+  return $services[strtoupper($service)] ?? 0;
+}
+
+/**
+ * Batch insert order items using SQL native batch insert with VALUES clause
+ * Optimized for performance and memory efficiency
+ * 
+ * @param PDO $pdo Database connection
+ * @param array $items Array of order item data
+ * @return array Array of inserted item IDs
+ */
+function batchInsertOrderItems($pdo, $items) {
+    if (empty($items)) {
+        return [];
+    }
+    
+    try {
+        // Process in chunks to avoid memory issues and query size limits
+        $chunk_size = 100; // Process 100 items at a time
+        $all_inserted_ids = [];
+        
+        $chunks = array_chunk($items, $chunk_size);
+        
+        foreach ($chunks as $chunk) {
+            // Define column names
+            $columns = [
+                'itemUuid', 'orderUuid', 'agents_id', 'vendors_id', 'terminals_id',
+                'group_name', 'orders_id', 'cost', 'description', 'group_id',
+                'notes', 'price', 'taxable', 'qty', 'items_id', 'discount',
+                'taxamount', 'itemid', 'ebt', 'crv', 'crv_taxable', 'itemDiscount',
+                'orderReference', 'status', 'itemsAddedDateTime', 'lastMod'
+            ];
+            
+            // Build VALUES clause with placeholders
+            $placeholders = [];
+            $values = [];
+            
+            foreach ($chunk as $item) {
+                $placeholders[] = '(' . implode(',', array_fill(0, count($columns), '?')) . ')';
+                foreach ($columns as $column) {
+                    $values[] = $item[$column] ?? null;
+                }
+            }
+            
+            // Build the complete SQL with optimized settings
+            $sql = "INSERT INTO orderItems (" . implode(', ', $columns) . ") VALUES " . implode(', ', $placeholders);
+            
+            // Execute batch insert with optimized settings
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($values);
+            
+            // Collect inserted IDs for this chunk
+            $first_id = $pdo->lastInsertId();
+            for ($i = 0; $i < count($chunk); $i++) {
+                $all_inserted_ids[] = $first_id + $i;
+            }
+            
+            // Free memory for large arrays
+            unset($placeholders, $values, $stmt);
+        }
+        
+        return $all_inserted_ids;
+        
+    } catch (PDOException $e) {
+        error_log("SQL batch insert failed: " . $e->getMessage());
+        error_log("SQL: " . ($sql ?? 'SQL not built'));
+        error_log("Values count: " . count($values ?? []));
+        throw $e;
+    }
+}
+
+// Convert status string to integer
+function getStatusCode($status) {
+    if (is_numeric($status)) {
+        return (int)$status;
+    }
+    
+    // Handle null or empty status
+    if (empty($status)) {
+        return 0; // Default to READY_TO_PAY
+    }
+    
+    $statusMap = [
+        "READY_TO_PAY" => 0,
+        "PAID" => 1,
+        "CANCELLED" => 2,
+        "PENDING" => 3
+    ];
+    return $statusMap[strtoupper($status)] ?? 0;
+}
+
+// -----------------------------------------------
+// Item-only reconciliation runner (inherit logic from reconcile_orders.php)
+// Usage (CLI):
+//   php reconcile_order_items.php --from-id=100 --to-id=200 [--force]
+// Or as GET params in web mode: ?from-id=100&to-id=200&force=true
+// -----------------------------------------------
+
+// Determine execution context and get parameters
+if (php_sapi_name() === 'cli') {
+  $options = getopt("", ["from-id:", "to-id:", "force", "debug"]);
+  $from_id = $options['from-id'] ?? null;
+  $to_id = $options['to-id'] ?? null;
+  $force = isset($options['force']);
+  $debug_mode = isset($options['debug']);
+} else {
+  $from_id = $_GET['from-id'] ?? null;
+  $to_id = $_GET['to-id'] ?? null;
+  $force = (($_GET['force'] ?? 'false') === 'true');
+  $debug_mode = (($_GET['debug'] ?? 'false') === 'true');
+}
+
+// Validate parameters
+if (!$from_id || !$to_id || !is_numeric($from_id) || !is_numeric($to_id) || (int)$from_id > (int)$to_id) {
+  http_response_code(400);
+  $msg = "Please provide a valid numeric range with --from-id and --to-id (from <= to).\n";
+  if (php_sapi_name() === 'cli') {
+    $msg .= "Usage: php reconcile_order_items.php --from-id=START --to-id=END [--force] [--debug]\n";
+  } else {
+    $msg .= "Example: ?from-id=100&to-id=200&force=true\n";
+  }
+  die($msg);
+}
+
+include_once __DIR__ . "/config/database.php";
+
+// Connect to the database
+try {
+  $databaseService = new DatabaseService();
+  $pdo = $databaseService->getConnection();
+  $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+  $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+  
+  // Light optimizations for longer runs
+  try {
+    $pdo->exec("SET SESSION autocommit = 1");
+    $pdo->exec("SET SESSION net_write_timeout = 600");
+    $pdo->exec("SET SESSION net_read_timeout = 600");
+  } catch (PDOException $e) {
+    // ignore if not supported
+  }
+} catch (PDOException $e) {
+  http_response_code(500);
+  error_log("Database connection failed: " . $e->getMessage());
+  die("Database connection failed.");
+}
+
+echo "Reconcile Order Items Only\n";
+echo "Range: " . (int)$from_id . " - " . (int)$to_id . "\n";
+echo "Force mode: " . ($force ? "ON" : "OFF") . "\n";
+
+$start_time = microtime(true);
+$orders_processed = 0;
+$orders_skipped = 0;
+$items_created_total = 0;
+$items_processed_total = 0;
+
+// Prepare reusable statements
+$stmt_order_by_id = $pdo->prepare("SELECT * FROM orders WHERE id = ?");
+$stmt_terminal_by_id = $pdo->prepare("SELECT * FROM terminals WHERE id = ?");
+$stmt_account_by_vendor = $pdo->prepare("SELECT * FROM accounts WHERE id = ?");
+$stmt_items_count_by_uuid = $pdo->prepare("SELECT COUNT(*) FROM orderItems WHERE orderUuid = ?");
+
+// Helper to decode JSON payloads (handles double-encoded)
+function decodeJsonPayload($content) {
+  $json_payload = json_decode($content);
+  $inner = $json_payload;
+  if (is_string($json_payload)) {
+    $inner = json_decode($json_payload);
+  }
+  return is_object($inner) ? $inner : null;
+}
+
+// Safely coerce a value into an array of associative arrays
+function ensureArray($value) {
+  if (is_array($value)) {
+    return $value;
+  }
+  if (is_string($value)) {
+    $decoded = json_decode($value, true);
+    return is_array($decoded) ? $decoded : [];
+  }
+  return [];
+}
+
+// Safely coerce a value into an array of stdClass objects
+function ensureArrayOfObjects($value) {
+  // If it's already an array, convert any associative arrays to objects
+  if (is_array($value)) {
+    $result = [];
+    foreach ($value as $elem) {
+      if (is_object($elem)) {
+        $result[] = $elem;
+      } elseif (is_array($elem)) {
+        $result[] = (object)$elem;
+      }
+    }
+    return $result;
+  }
+  // If it's a JSON string, decode into objects
+  if (is_string($value)) {
+    $decoded = json_decode($value);
+    if (is_array($decoded)) {
+      return $decoded;
+    }
+    if (is_object($decoded)) {
+      return [$decoded];
+    }
+  }
+  return [];
+}
+
+// Fetch a batch of JSON records containing the given order UUID, ordered by newest first.
+// Optionally constrain by lastmod within +/- 2 days of the provided order lastMod timestamp.
+function findJsonBatchForOrderUuid($pdo, $orderUuid, $beforeId = null, $limit = 100, $orderLastModTs = null) {
+  $limit = (int)$limit;
+  $needle = '%' . $orderUuid . '%';
+  $useDateRange = false;
+  $start = null;
+  $end = null;
+  if (!empty($orderLastModTs)) {
+    $ts = is_numeric($orderLastModTs) ? (int)$orderLastModTs : strtotime($orderLastModTs);
+    if ($ts !== false && $ts > 0) {
+      $start = date('Y-m-d 00:00:00', strtotime('-2 days', $ts));
+      $end = date('Y-m-d 23:59:59', strtotime('+2 days', $ts));
+      $useDateRange = true;
+    }
+  }
+  if ($beforeId) {
+    $beforeId = (int)$beforeId;
+    echo "findJsonBatchForOrderUuid: beforeId={$beforeId}, limit={$limit}";
+    if ($useDateRange) echo ", lastmod BETWEEN {$start} AND {$end}";
+    echo "\n";
+    if ($useDateRange) {
+      $sql = "SELECT id, serial, content FROM json WHERE content LIKE ? AND lastmod BETWEEN ? AND ? AND id < ? ORDER BY id DESC LIMIT $limit";
+      $params = [$needle, $start, $end, $beforeId];
+    } else {
+      $sql = "SELECT id, serial, content FROM json WHERE content LIKE ? AND id < ? ORDER BY id DESC LIMIT $limit";
+      $params = [$needle, $beforeId];
+    }
+    // Build debug SQL with inlined params
+    $debugSql = $sql;
+    foreach ($params as $p) {
+      $val = is_numeric($p) ? $p : ("'" . addslashes($p) . "'");
+      $debugSql = preg_replace('/\?/', $val, $debugSql, 1);
+    }
+    echo "findJsonBatchForOrderUuid SQL: {$debugSql}\n";
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($params);
+  } else {
+    echo "findJsonBatchForOrderUuid: beforeId=NULL, limit={$limit}";
+    if ($useDateRange) echo ", lastmod BETWEEN {$start} AND {$end}";
+    echo "\n";
+    if ($useDateRange) {
+      $sql = "SELECT id, serial, content FROM json WHERE content LIKE ? AND lastmod BETWEEN ? AND ? ORDER BY id DESC LIMIT $limit";
+      $params = [$needle, $start, $end];
+    } else {
+      $sql = "SELECT id, serial, content FROM json WHERE content LIKE ? ORDER BY id DESC LIMIT $limit";
+      $params = [$needle];
+    }
+    // Build debug SQL with inlined params
+    $debugSql = $sql;
+    foreach ($params as $p) {
+      $val = is_numeric($p) ? $p : ("'" . addslashes($p) . "'");
+      $debugSql = preg_replace('/\?/', $val, $debugSql, 1);
+    }
+    echo "findJsonBatchForOrderUuid SQL: {$debugSql}\n";
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($params);
+  }
+  $rows = $stmt->fetchAll() ?: [];
+  if (!empty($rows)) {
+    $firstId = $rows[0]['id'];
+    $lastId = $rows[count($rows) - 1]['id'];
+    echo "findJsonBatchForOrderUuid: fetched " . count($rows) . " rows; id range [$lastId .. $firstId]\n";
+  } else {
+    echo "findJsonBatchForOrderUuid: fetched 0 rows; ending search for this UUID batch\n";
+    return [];
+  }
+  return $rows;
+}
+
+for ($oid = (int)$from_id; $oid <= (int)$to_id; $oid++) {
+  echo "\n=== Processing Order ID: $oid ===\n";
+  
+  // Fetch order
+  $stmt_order_by_id->execute([$oid]);
+  $order = $stmt_order_by_id->fetch();
+  if (!$order) {
+    echo "❌ SKIPPED: Order not found.\n";
+    $orders_skipped++;
+    continue;
+  }
+  echo "Found order: " . json_encode($order) . "\n";
+  $order_uuid = $order['uuid'];
+  $terminals_id = $order['terminals_id'];
+  $vendors_id = $order['vendors_id'];
+  $orderDate = $order['orderDate'] ?? null;
+  $orderReference = $order['orderReference'];
+
+  if (empty($order_uuid)) {
+    echo "❌ SKIPPED: Order UUID is missing.\n";
+    $orders_skipped++;
+    continue;
+  }
+  
+  // Existing items?
+  $stmt_items_count_by_uuid->execute([$order_uuid]);
+  $existing_count = (int)$stmt_items_count_by_uuid->fetchColumn();
+  
+  if (!$force && $existing_count > 0) {
+    echo "❌ SKIPPED: Order already has $existing_count item(s). Use --force to replace.\n";
+    $orders_skipped++;
+    continue;
+  }
+  echo "Order has no items.\n";
+  
+  // Terminal and agent info
+  $stmt_terminal_by_id->execute([$terminals_id]);
+  $terminal = $stmt_terminal_by_id->fetch();
+  if (!$terminal) {
+    echo "❌ SKIPPED: Terminal not found for terminals_id=$terminals_id.\n";
+    $orders_skipped++;
+    continue;
+  }
+  echo "Terminal found: " . json_encode($terminal) . "\n";
+  $serial = $terminal['serial'];
+  
+  $stmt_account_by_vendor->execute([$vendors_id]);
+  $account = $stmt_account_by_vendor->fetch();
+  $agents_id = $account['accounts_id'] ?? null;
+  
+  // Locate JSON containing this order (by UUID). If not found in newest, paginate older.
+  echo "Search context: order_uuid={$order_uuid}, orderReference={$orderReference}, order_lastMod=" . ($order['lastMod'] ?? 'null') . "\n";
+  $found_items_payload = null;
+  $found_groups_payload = null;
+  $found_is_online = false;
+  $beforeId = null;
+  while (true) {
+    $candidate_jsons = findJsonBatchForOrderUuid($pdo, $order_uuid, $beforeId, 100, $order['lastMod'] ?? null);
+    if (empty($candidate_jsons)) {
+      break;
+    }
+    foreach ($candidate_jsons as $jrec) {
+      echo "Inspecting json id={$jrec['id']} serial={$jrec['serial']}\n";
+      $inner = decodeJsonPayload($jrec['content']);
+      if (!$inner) {
+        echo "json id={$jrec['id']}: decodeJsonPayload failed\n";
+        continue;
+      }
+        $orders_json = ensureArrayOfObjects($inner->orders ?? []);
+        $items_json = ensureArrayOfObjects($inner->items ?? []);
+        $groups_json = ensureArrayOfObjects($inner->groups ?? []);
+      $isOnlinePlatform = $inner->isOnlinePlatform ?? false;
+      echo "json id={$jrec['id']}: counts orders=" . count($orders_json) . " items=" . count($items_json) . " groups=" . count($groups_json) . " isOnlinePlatform=" . ($isOnlinePlatform ? "1" : "0") . "\n";
+      // Log up to first 5 order ids to verify structure
+      $sampleIds = [];
+      foreach ($orders_json as $od) {
+        if (isset($od->id)) { $sampleIds[] = strval($od->id); }
+        if (count($sampleIds) >= 5) { break; }
+      }
+      if (!empty($sampleIds)) {
+        echo "json id={$jrec['id']}: sample order ids=[" . implode(',', $sampleIds) . "]\n";
+      }
+      
+      // Does this JSON contain our order by checking items[].orderItem.oUUID?
+      $contains = false;
+      foreach ($items_json as $item_data) {
+        $o_uuid_in_json = $item_data->orderItem->oUUID ?? null;
+        if (!empty($o_uuid_in_json) && strval($o_uuid_in_json) === strval($order_uuid)) {
+          $contains = true;
+          echo "json id={$jrec['id']}: MATCH found in items[].orderItem.oUUID={$o_uuid_in_json} (matches order_uuid={$order_uuid})\n";
+          break;
+        }
+      }
+      if ($contains) {
+        echo "json id={$jrec['id']}: MATCH oUUID={$order_uuid}. Using this JSON for items.\n";
+        $found_items_payload = $items_json;
+        $found_groups_payload = $groups_json;
+        $found_is_online = $isOnlinePlatform;
+        break 2; // Found; exit both loops
+      } else {
+        echo "json id={$jrec['id']}: no matching oUUID={$order_uuid} in items[].orderItem.oUUID\n";
+      }
+    }
+    // paginate to older records
+    $last = end($candidate_jsons);
+    $beforeId = $last['id'] ?? null;
+    if (!$beforeId) {
+      break;
+    }
+  }
+  
+  if ($found_items_payload === null) {
+    echo "❌ SKIPPED: Could not locate order items in any JSON records for this UUID.\n";
+    $orders_skipped++;
+    continue;
+  }
+  
+  // Force: clear prior items
+  if ($existing_count > 0 && $force) {
+    try {
+      $stmt_del = $pdo->prepare("DELETE FROM orderItems WHERE orderUuid = ? LIMIT 1000");
+      $deleted_total = 0;
+      do {
+        $stmt_del->execute([$order_uuid]);
+        $deleted = $stmt_del->rowCount();
+        $deleted_total += $deleted;
+      } while ($deleted > 0);
+      echo "Cleared $deleted_total previous item(s).\n";
+    } catch (PDOException $e) {
+      error_log("Failed to clear items for orderUuid=$order_uuid: " . $e->getMessage());
+      echo "❌ SKIPPED: Failed to clear existing items.\n";
+      $orders_skipped++;
+      continue;
+    }
+  }
+  
+  // Build group name map
+  $group_names = [];
+  foreach ($found_groups_payload as $group) {
+    if (isset($group->id)) {
+      $group_names[$group->id] = $group->description ?? '';
+    }
+  }
+  
+  // Build batch of items for this order
+  $batch_items = [];
+  $items_with_mods = [];
+  
+  foreach ($found_items_payload as $item_data) {
+    if (!isset($item_data->orderItem) || !isset($item_data->orderItem->orderReference)) {
+      continue;
+    }
+    if (strval($item_data->orderItem->orderReference) !== strval($orderReference)) {
+      continue;
+    }
+    
+    $col = (array)$item_data->orderItem;
+    $col2 = (array)($item_data->item ?? []);
+    
+    // group name
+    $group_name = $group_names[$col["group"]] ?? '';
+    
+    // itemsAddedDateTime
+    $itemAddedDateTime = time();
+    if (isset($col["itemAddedDateTime"])) {
+      $parsedDate = strtotime($col["itemAddedDateTime"]);
+      if ($parsedDate !== false) {
+        $itemAddedDateTime = $parsedDate;
+      }
+    }
+    
+    $item_row = [
+      'itemUuid' => ($found_is_online ? ($col["uuid"] ?? null) : ($col["iUUID"] ?? null)) ?? null,
+      'orderUuid' => $order_uuid,
+      'agents_id' => $agents_id,
+      'vendors_id' => $vendors_id,
+      'terminals_id' => $terminals_id,
+      'group_name' => $group_name,
+      'orders_id' => $order['id'],
+      'cost' => $col["cost"] ?? 0,
+      'description' => $col["description"] ?? '',
+      'group_id' => $col["group"] ?? 0,
+      'notes' => $col2["notes"] ?? "",
+      'price' => $col["price"] ?? 0,
+      'taxable' => $col["taxable"] ?? 0,
+      'qty' => $col["qty"] ?? 1,
+      'items_id' => '0',
+      'discount' => $col["discount"] ?? 0,
+      'taxamount' => $col["taxAmount"] ?? 0,
+      'itemid' => $col["itemId"] ?? 0,
+      'ebt' => $col["ebt"] ?? 0,
+      'crv' => (isset($col["crv"]) && is_object($col["crv"]) ? ($col["crv"]->val ?? 0) : 0),
+      'crv_taxable' => (isset($col["crv"]) && is_object($col["crv"]) ? ($col["crv"]->is_taxable ?? 0) : 0),
+      'itemDiscount' => $col["itemDiscount"] ?? 0,
+      'orderReference' => $order['id'],
+      'status' => getStatusCode($col["status"] ?? null),
+      'itemsAddedDateTime' => $itemAddedDateTime,
+      'lastMod' => time()
+    ];
+    
+    $batch_items[] = $item_row;
+    
+    // track mods
+    if (isset($item_data->mods) && is_array($item_data->mods) && count($item_data->mods) > 0) {
+      $items_with_mods[] = [
+        'item_data' => $item_data,
+        'col' => $col,
+        'batch_index' => count($batch_items) - 1
+      ];
+    }
+  }
+  
+  if (empty($batch_items)) {
+    echo "No items found for this order in JSON. Skipping.\n";
+    $orders_skipped++;
+    continue;
+  }
+  
+  // Insert items batch
+  $inserted_item_ids = batchInsertOrderItems($pdo, $batch_items);
+  echo "Inserted " . count($inserted_item_ids) . " item(s).\n";
+  $items_created_total += count($inserted_item_ids);
+  $items_processed_total += count($batch_items);
+  
+  // Insert mods batch (if any)
+  if (!empty($items_with_mods)) {
+    $mod_batch_items = [];
+    foreach ($items_with_mods as $item_with_mods) {
+      $item_data = $item_with_mods['item_data'];
+      $batch_index = $item_with_mods['batch_index'];
+      $parent_item_id = $inserted_item_ids[$batch_index] ?? null;
+      if ($parent_item_id === null) {
+        continue;
+      }
+      foreach ($item_data->mods as $mod_data) {
+        $mod_col = (array)$mod_data;
+        if (!isset($mod_col["taxAmount"])) {
+          $mod_col["taxAmount"] = "0";
+        }
+        if (!isset($mod_col["itemId"])) {
+          $mod_col["itemId"] = "0";
+        }
+        $mod_row = [
+          'itemUuid' => ($found_is_online ? ($mod_col["uuid"] ?? null) : ($mod_col["iUUID"] ?? null)) ?? null,
+          'orderUuid' => $order_uuid,
+          'agents_id' => $agents_id ?? -1,
+          'vendors_id' => $vendors_id,
+          'terminals_id' => $terminals_id,
+          'group_name' => null,
+          'orders_id' => $order['id'],
+          'cost' => $mod_col["cost"] ?? 0,
+          'description' => $mod_col["description"] ?? '',
+          'group_id' => $mod_col["group"] ?? 0,
+          'notes' => $mod_col["notes"] ?? "",
+          'price' => $mod_col["price"] ?? 0,
+          'taxable' => $mod_col["taxable"] ?? 0,
+          'qty' => $mod_col["qty"] ?? 1,
+          'items_id' => $parent_item_id,
+          'discount' => $mod_col["discount"] ?? 0,
+          'taxamount' => $mod_col["taxAmount"],
+          'itemid' => $mod_col["itemId"],
+          'ebt' => $mod_col["ebt"] ?? 0,
+          'crv' => ($mod_col["crv"] ?? 0),
+          'crv_taxable' => ($mod_col["crv_taxable"] ?? 0),
+          'itemDiscount' => 0,
+          'orderReference' => $order['id'],
+          'status' => getStatusCode($mod_col["status"] ?? null),
+          'itemsAddedDateTime' => time(),
+          'lastMod' => time()
+        ];
+        $mod_batch_items[] = $mod_row;
+      }
+    }
+    if (!empty($mod_batch_items)) {
+      batchInsertOrderItems($pdo, $mod_batch_items);
+      echo "Inserted " . count($mod_batch_items) . " modifier item(s).\n";
+      $items_created_total += count($mod_batch_items);
+      $items_processed_total += count($mod_batch_items);
+    }
+  }
+  
+  $orders_processed++;
+  echo "✅ Done Order ID $oid\n";
+}
+
+$elapsed = round(microtime(true) - $start_time, 2);
+echo "\n----------------------------------------\n";
+echo "Orders processed: $orders_processed\n";
+echo "Orders skipped: $orders_skipped\n";
+echo "Order items processed (rows prepared): $items_processed_total\n";
+echo "Order items created (rows inserted): $items_created_total\n";
+echo "Elapsed: {$elapsed}s\n";
+

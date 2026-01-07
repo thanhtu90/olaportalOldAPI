@@ -1,0 +1,633 @@
+<?php
+ini_set("display_errors", 1);
+include_once "./library/utils.php";
+
+function call_inventory_lock($orderUuid)
+{
+  if (!$orderUuid) {
+    return null;
+  }
+
+  // Skip actual inventory lock in test mode
+  if (isset($_SERVER['HTTP_X_TEST_MODE']) && $_SERVER['HTTP_X_TEST_MODE'] === 'true') {
+    return null;
+  }
+
+  $ch = curl_init();
+  curl_setopt($ch, CURLOPT_URL, "localhost:8090/api/v1/inventory/order-lock/" . $orderUuid);
+  curl_setopt($ch, CURLOPT_POST, 1);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+
+  $response = curl_exec($ch);
+  $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+  curl_close($ch);
+
+  if ($httpcode != 200) {
+    $error = json_decode($response, true);
+    return isset($error['error']) ? $error['error'] : 'Failed to lock inventory';
+  }
+  return null;
+}
+
+function call_inventory_paid($orderUuid)
+{
+  if (!$orderUuid) {
+    return null;
+  }
+
+  // Skip actual inventory paid in test mode
+  if (isset($_SERVER['HTTP_X_TEST_MODE']) && $_SERVER['HTTP_X_TEST_MODE'] === 'true') {
+    return null;
+  }
+
+  $ch = curl_init();
+  curl_setopt($ch, CURLOPT_URL, "localhost:8090/api/v1/inventory/order-paid/" . $orderUuid);
+  curl_setopt($ch, CURLOPT_POST, 1);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+
+  $response = curl_exec($ch);
+  $httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+  curl_close($ch);
+
+  if ($httpcode != 200) {
+    $error = json_decode($response, true);
+    return isset($error['error']) ? $error['error'] : 'Failed to process order payment';
+  }
+  return null;
+}
+
+//enable_cors();
+$msgfornoterminal = "No permission";
+$msgforsqlerror = "Unable to insert data";
+$pdo = connect_db_and_set_http_method("POST");
+$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_WARNING);
+$params = get_params_from_http_body([
+  "serial",
+  "json"
+]);
+
+// The json is already decoded by get_params_from_http_body
+$jsonData = $params["json"];
+if (!is_array($jsonData)) {
+  send_http_status_and_exit("400", "Invalid JSON format");
+}
+
+$stmt = $pdo->prepare("select * from terminals where serial = ?");
+$stmt->execute([$params["serial"]]);
+if ($stmt->rowCount() == 0) {
+  send_http_status_and_exit("403", $msgfornoterminal);
+}
+$row = $stmt->fetch();
+
+#get terminal id, vendor id, and agent id
+$terminals_id = $row["id"];
+$vendors_id = $row["vendors_id"];
+$stmt2 = $pdo->prepare("select * from accounts where id = ?");
+$stmt2->execute([$vendors_id]);
+$row2 = $stmt2->fetch();
+
+####log raw data
+$params["json"] = str_replace('&quot;', '"', $params["json"]);
+$stmt = $pdo->prepare("insert into json set serial = ?, content = ?");
+$res = $stmt->execute([$params["serial"], $params["json"]]);
+
+#deal with test data here
+#$stmt = $pdo->prepare("select * from json where id = ?");
+#$stmt->execute([ "330" ]);
+#$row = $stmt->fetch();
+$row["content"] = str_replace('&quot;', '"', $params["json"]);
+
+$payments = $jsonData["payments"] ?? [];
+$items_json = $jsonData["items"] ?? [];
+$orders_json = $jsonData["orders"] ?? [];
+$groups_json = $jsonData["groups"] ?? [];
+$termId = $jsonData["termId"] ?? null;
+$itemdata_json = $jsonData["itemdata"] ?? [];
+$hasInventory = $jsonData["hasInventory"] ?? false;
+$agents_id = $hasInventory ? ($row2["accounts_id"] ?? -1) : $row2["accounts_id"];
+
+$group_names = array();
+for ($i = 0; $i < count($groups_json); $i++) {
+  $groups_id = $groups_json[$i]->{"id"};
+  $description = $groups_json[$i]->{"description"};
+  $groupType = $groups_json[$i]->{"groupType"};
+  $notes = $groups_json[$i]->{"notes"};
+  $lastMod = $groups_json[$i]->{"lastMod"};
+  $group_names[$groups_id] = $description;
+  #  $stmt = $pdo->prepare("select * from groups where lastMod = ?");
+  #  $stmt->execute([ $lastMod ]);
+  #  if ( $stmt->rowCount() != 0 ) { //should be zero
+  #    continue;
+  #  } else {
+  #    $stmt = $pdo->prepare("insert into groups set agents_id = ?, vendors_id = ?, terminals_id = ?, groups_id = ?, description = ?, groupType = ?, notes = ?, lastMod = ?");
+  #    $stmt->execute([ $agents_id, $vendors_id, $terminals_id, $groups_id, $description, $groupType, $notes, $lastMod ]);
+  #  }
+}
+
+$fp = fopen("./tmp/aa.txt", "a");
+fputs($fp, time() . " 開始處理資料\n");
+fclose($fp);
+
+#必須先掃一次傳上來的payment; 如果payDate已經存在，就要把order, orderPayments, orderItems都清空, 再重新插入; 這邊是因應orderPayments在refund後lastmod改變但payrDate不變
+for ($i = 0; $i < count($payments); $i++) {
+  $payDate = strtotime($payments[$i]->{"payDate"});
+
+  #if online order then order reference is okay; if not online order then order reference duplication would be long ago 
+  $orderReference = $payments[$i]->{"orderReference"};
+  $stmt = $pdo->prepare("select * from orders where terminals_id = ? and orderReference = ? order by id desc limit 0,1");
+  $stmt->execute([$terminals_id,  $orderReference]);
+  $row2 = $stmt->fetch();
+
+  $stmt = $pdo->prepare("select * from ordersPayments where terminals_id = ? and payDate = ? and payDate != 0 and orderReference = ?");
+  $stmt->execute([$terminals_id, $payDate, $row2["id"]]);
+  if ($stmt->rowCount() != 0) {
+    $row = $stmt->fetch();
+    $id = $row["id"];
+    $stmt2 = $pdo->prepare("update ordersPayments set refund = ?, lastMod = ? where id = ?");
+    $stmt2->execute([$payments[$i]->{"refund"}, $payments[$i]->{"lastMod"}, $id]);
+    #$orderReference = $row["orderReference"];
+    #$stmt = $pdo->prepare("delete from ordersPayments where terminals_id = ? and id = ?");
+    #$stmt->execute([ $terminals_id, $id ]);
+    #$stmt = $pdo->prepare("delete from orders where terminals_id = ? and id = ?");
+    #$stmt->execute([ $terminals_id, $orderReference ]);
+    #$stmt = $pdo->prepare("delete from orderItems where terminals_id = ? and orders_id = ?");
+    #$stmt->execute([ $terminals_id, $orderReference ]);
+
+    $fp = fopen("./tmp/aa.txt", "a");
+    fputs($fp, time() . " 更新refund資料\n");
+    fclose($fp);
+  }
+}
+
+
+#id map, orderPayments的orderReference不應該是機器上的Orders ID,應該要是主機上的Orders ID
+$orderRefMap = array();
+for ($i = 0; $i < count($orders_json); $i++) {
+  $orderReference = $orders_json[$i]->{"id"};
+  $subTotal = $orders_json[$i]->{"subTotal"};
+  $tax = $orders_json[$i]->{"tax"};
+  $total = $orders_json[$i]->{"total"};
+  $notes = $orders_json[$i]->{"notes"};
+  $lastMod = $orders_json[$i]->{"lastMod"};
+  $employee_id = $orders_json[$i]->{"employeeId"};
+  $orderDate = strtotime($orders_json[$i]->{"orderDate"});
+  // new fields
+  $order_uuid = $orders_json[$i]->{"oUUID"};
+  $employee_pin = $orders_json[$i]->{"employeePIN"};
+  $delivery_type = "";
+  $delivery_fee = "";
+  $onlineorder_id = "";
+  $onlinetrans_id = "";
+  if (isset($orders_json[$i]->{"delivery_fee"})) {
+    $delivery_fee = $orders_json[$i]->{"delivery_fee"};
+  }
+  if (isset($orders_json[$i]->{"delivery_type"})) {
+    $delivery_type = $orders_json[$i]->{"delivery_type"};
+  }
+  if (isset($orders_json[$i]->{"onlineorder_id"})) {
+    $onlineorder_id = $orders_json[$i]->{"onlineorder_id"};
+  }
+  if (isset($orders_json[$i]->{"onlinetrans_id"})) {
+    $onlinetrans_id = $orders_json[$i]->{"onlinetrans_id"};
+  }
+  #$stmt = $pdo->prepare("select * from orders where terminals_id = ? and lastMod = ?");
+  #$stmt->execute([ $terminals_id, $lastMod ]);
+  $stmt = $pdo->prepare("select * from orders where terminals_id = ? and orderDate = ? and orderReference = ?");
+  $stmt->execute([$terminals_id, $orderDate, $orderReference]);
+  if ($stmt->rowCount() != 0) { //should be zero
+    $fp = fopen("./tmp/aa.txt", "w");
+    fputs($fp, time() . " 資料庫中仍有相同lastMod的資料 跳過\n");
+    fclose($fp);
+    continue;
+  } else {
+    $fp = fopen("./tmp/aa.txt", "w");
+    fputs($fp, time() . " 資料庫中沒有相同lastMod的資料 新增\n");
+    fclose($fp);
+    $stmt = $pdo->prepare("insert into orders set uuid = ?, agents_id = ?, vendors_id = ?, terminals_id = ?, orderReference = ?, subTotal = ?, tax = ?, total = ?, notes = ?, lastMod = ?, employee_id = ?, orderDate = ?, delivery_fee = ?, delivery_type = ?, employee_pin = ?, onlineorder_id = ?, onlinetrans_id = ?");
+    $stmt->execute([
+      $order_uuid ?? null,
+      $agents_id,
+      $vendors_id,
+      $terminals_id,
+      $orderReference,
+      $subTotal,
+      $tax,
+      $total,
+      $notes,
+      $lastMod,
+      $employee_id,
+      $orderDate,
+      $delivery_fee,
+      $delivery_type,
+      $employee_pin,
+      $onlineorder_id,
+      $onlinetrans_id
+    ]);
+    $orderRefMap[strval($orderReference)] = $pdo->lastInsertId();
+
+    // call lock inventory if there is no payment and hasInventory is true
+    if (count($payments) == 0 && $hasInventory) {
+      $error = call_inventory_lock($orders_json[$i]->{"uuid"});
+      if ($error) {
+        send_http_status_and_exit("400", $error);
+      }
+
+      // Insert order items when no payment but has inventory
+      for ($j = 0; $j < count($items_json); $j++) {
+        $col = (array) $items_json[$j]->{"orderItem"};
+        $col2 = (array) $items_json[$j]->{"item"};
+        $stmt = $pdo->prepare("insert into orderItems set 
+            agents_id = ?, 
+            vendors_id = ?, 
+            terminals_id = ?, 
+            group_name = ?, 
+            orders_id = ?, 
+            cost = ?, 
+            description = ?, 
+            group_id = ?, 
+            notes = ?, 
+            price = ?, 
+            taxable = ?, 
+            qty = ?, 
+            items_id = ?, 
+            discount = ?,
+            taxamount = ?,
+            itemid = ?,
+            orderReference = ?,
+            itemsAddedDateTime = ?,
+            lastMod = ?,
+            status = ?,
+            itemUuid = ?,
+            orderUuid = ?
+        ");
+        $stmt->execute([
+          $agents_id,
+          $vendors_id,
+          $terminals_id,
+          $group_names[$col["group"]] ?? '',
+          $orderRefMap[strval($orderReference)],
+          $col["cost"],
+          $col["description"],
+          $col["group"],
+          $col2["notes"],
+          $col["price"],
+          $col["taxable"],
+          $col["qty"],
+          $col2["id"],
+          $col["discount"],
+          $col["taxAmount"] ?? 0,
+          $col2["id"],
+          $orderReference,
+          time(),
+          $col["lastMod"],
+          0,
+          $col2["uuid"],
+          $orders_json[$i]->{"uuid"}
+        ]);
+        $items_id = $pdo->lastInsertId();
+
+        // Insert modifiers if any
+        for ($k = 0; $k < count($items_json[$j]->{"mods"}); $k++) {
+          $col = (array) $items_json[$j]->{"mods"}[$k];
+          $stmt = $pdo->prepare("insert into orderItems set 
+              agents_id = ?, 
+              vendors_id = ?, 
+              terminals_id = ?, 
+              orders_id = ?, 
+              cost = ?, 
+              description = ?, 
+              group_id = ?, 
+              notes = ?, 
+              price = ?, 
+              taxable = ?, 
+              items_id = ?,
+              taxamount = ?,
+              itemid = ?,
+              orderReference = ?,
+              itemsAddedDateTime = ?,
+              lastMod = ?,
+              status = ?,
+              qty = ?
+          ");
+          $stmt->execute([
+            $agents_id,
+            $vendors_id,
+            $terminals_id,
+            $orderRefMap[strval($orderReference)],
+            $col["cost"],
+            $col["description"],
+            $col["group"],
+            $col["notes"],
+            $col["price"],
+            $col["taxable"],
+            $items_id,
+            0,
+            0,
+            $orderReference,
+            time(),
+            time(),
+            0,
+            1
+          ]);
+        }
+      }
+    }
+
+    #insert and get new payment id
+    for ($j = 0; $j < count($items_json); $j++) {
+      if ($payments[$i]->{"orderReference"} == strval($items_json[$j]->{"orderItem"}->{"orderReference"})) {
+        #insert all item detail with new payment id
+        $col = (array) $items_json[$j]->{"orderItem"};
+        $col2 = (array) $items_json[$j]->{"item"};
+        if (!isset($col2["notes"])) {
+          $col2["notes"] = "";
+        }
+        if (!isset($col["taxAmount"])) {
+          $col["taxAmount"] = "0";
+        }
+        if (!isset($col["itemId"])) {
+          $col["itemId"] = "0";
+        }
+        #var_dump( $col );
+        $order_stmt = $pdo->prepare("select * from orders where id = ?;");
+        $order_stmt->execute([$orderRefMap[strval($orderReference)]]);
+        $order = $order_stmt->fetch();
+        $stmt = $pdo->prepare("insert into orderItems set 
+          itemUuid = ?, 
+          orderUuid = ?, 
+          agents_id = ?, 
+          vendors_id = ?, 
+          terminals_id = ?, 
+          group_name = ?, 
+          orders_id = ?, 
+          cost = ?, 
+          description = ?, 
+          group_id = ?, 
+          notes = ?, 
+          price = ?, 
+          taxable = ?, 
+          qty = ?, 
+          items_id = ?, 
+          discount = ?, 
+          taxamount = ?, 
+          itemid = ?, 
+          ebt = ?, 
+          crv = ?, 
+	  crv_taxable = ?,
+          itemDiscount = ?");
+        $stmt->execute([
+          $col["iUUID"] ?? null,
+          $order["uuid"],
+          $agents_id,
+          $vendors_id,
+          $terminals_id,
+          $group_names[$col["group"]],
+          $orderRefMap[strval($orderReference)],
+          $col["cost"],
+          $col["description"],
+          $col["group"],
+          $col2["notes"],
+          $col["price"],
+          $col["taxable"],
+          $col["qty"],
+          '0',
+          $col["discount"],
+          $col["taxAmount"],
+          $col["itemId"],
+          $col["ebt"] ?? 0,
+          $col["crv"] ?? 0,
+          $col["crv_taxable"] ?? 0,
+          $col["itemDiscount"] ?? 0
+        ]);
+        $items_id = $pdo->lastInsertId();
+        for ($k = 0; $k < count($items_json[$j]->{"mods"}); $k++) {
+          $col = (array) $items_json[$j]->{"mods"}[$k];
+          if (!isset($col["taxAmount"])) {
+            $col["taxAmount"] = "0";
+          }
+          if (!isset($col["itemId"])) {
+            $col["itemId"] = "0";
+          }
+          $stmt = $pdo->prepare("insert into orderItems set itemUuid = ?, orderUuid = ?, agents_id = ?, vendors_id = ?, terminals_id = ?, orders_id = ?, cost = ?, description = ?, group_id = ?, notes = ?, price = ?, taxable = ?, items_id = ?, taxamount = ?, itemid = ?, ebt = ?, crv = ?, crv_taxable = ?");
+          $stmt->execute([
+            $col["iUUID"] ?? null,
+            $col["oUUID"] ?? null,
+            $agents_id,
+            $vendors_id,
+            $terminals_id,
+            $orderRefMap[strval($orderReference)],
+            $col["cost"],
+            $col["description"],
+            $col["group"],
+            $col["notes"],
+            $col["price"],
+            $col["taxable"],
+            $items_id,
+            $col["taxAmount"],
+            $col["itemId"],
+            $col["ebt"] ?? 0,
+            $col["crv"] ?? 0,
+            $col["crv_taxable"] ?? 0,
+          ]);
+        }
+      }
+    }
+  }
+}
+
+for ($i = 0; $i < count($payments); $i++) {
+  #check if lastmod exist, if so next
+  $payment_uuid = $payments[$i]->{"pUUID"};
+  $order_uuid = $payments[$i]->{"oUUID"};
+  $olapayApprovalId = $payments[$i]->{"olapayApprovalId"};
+  $employee_id = $payments[$i]->{"employeeId"};
+  $amtPaid = $payments[$i]->{"amtPaid"};
+  #$payDate = $payments[$i]->{"payDate"};
+  $total = $payments[$i]->{"total"};
+  $refNumber = $payments[$i]->{"refNumber"};
+  $tips = $payments[$i]->{"tips"};
+  $refund = $payments[$i]->{"refund"};
+  $payDate = strtotime($payments[$i]->{"payDate"});
+  $techFee = $payments[$i]->{"techfee"};
+  $lastMod = $payments[$i]->{"lastMod"};
+  $orderId = $payments[$i]->{"orderID"};
+  $orderRef = $orderRefMap[strval($payments[$i]->{"orderReference"})];
+  #echo $amtPaid . " " . $total . " " . $lastMod . " " . $orderRef;
+  $stmt = $pdo->prepare("select * from ordersPayments where terminals_id = ? and lastMod = ?");
+  $stmt->execute([$terminals_id, $lastMod]);
+  if ($stmt->rowCount() != 0) { //should be zero
+    //if ( 0 ) {
+    continue;
+  } else {
+    $stmt = $pdo->prepare("insert into ordersPayments set 
+    paymentUuid = ?, 
+    orderUuid = ?, 
+    olapayApprovalId = ?, 
+    agents_id = ?, 
+    vendors_id = ?, 
+    terminals_id = ?, 
+    amtPaid = ?, 
+    total = ?, 
+    refNumber = ?, 
+    tips = ?, 
+    techFee = ?, 
+    orderReference = ?, 
+    orderId = ?, 
+    refund = ?, 
+    payDate = ?, 
+    lastMod = ?, 
+    employee_id = ?");
+    $stmt->execute([
+      $payment_uuid ?? null,
+      $order_uuid ?? null,
+      $olapayApprovalId ?? null,
+      $agents_id,
+      $vendors_id,
+      $terminals_id,
+      $amtPaid,
+      $total,
+      $refNumber,
+      $tips,
+      $techFee,
+      $orderRef,
+      $orderId,
+      $refund,
+      $payDate,
+      $lastMod,
+      $employee_id
+    ]);
+    #$orders_id = $pdo->lastInsertId();
+    #update orderId
+    #$stmt = $pdo->prepare("update ordersPayments set orderId = ? where id = ?");
+    #$stmt->execute([ $termId . '0' . $orderRef, $orders_id  ]);
+
+    // delete pending order
+
+    $delete_pending_order_stmt = $pdo->prepare("delete from pending_orders where 
+    uuid = ?");
+    $delete_pending_order_stmt->execute([$order_uuid]);
+
+    // release inventory lock only if hasInventory is true
+    if ($hasInventory) {
+      $orderUuid = $orders_json[array_search(strval($payments[$i]->{"orderReference"}), array_column($orders_json, 'id'))]->{"uuid"};
+      $error = call_inventory_paid($orderUuid);
+      if ($error) {
+        send_http_status_and_exit("400", $error);
+      }
+    }
+  }
+  ////
+  #insert and get new payment id
+  /*
+  for ( $j = 0; $j < count($items_json); $j++ ) {
+    if ( $payments[$i]->{"orderReference"} == strval($items_json[$j]->{"orderItem"}->{"orderReference"}) && $ignoreOrderItemMap[strval($orderReference)] == "0") {
+       #insert all item detail with new payment id
+      $col = (array) $items_json[$j]->{"orderItem"};
+      $col2 = (array) $items_json[$j]->{"item"};
+      if ( !isset($col2["notes"]) ) { $col2["notes"] = ""; }
+      if ( !isset($col["taxAmount"]) ) { $col["taxAmount"] = "0"; }
+      if ( !isset($col["itemId"]) ) { $col["itemId"] = "0"; }
+      #var_dump( $col );
+      $stmt = $pdo->prepare("insert into orderItems set agents_id = ?, vendors_id = ?, terminals_id = ?, group_name = ?, orders_id = ?, cost = ?, description = ?, group_id = ?, notes = ?, price = ?, taxable = ?, qty = ?, items_id = ?, discount = ?, taxamount = ?, itemid = ?");
+      $stmt->execute([ $agents_id, $vendors_id, $terminals_id, $group_names[$col["group"]], $orderRef, $col["cost"], $col["description"],  $col["group"], $col2["notes"], $col["price"], $col["taxable"], $col["qty"], '0', $col["discount"], $col["taxAmount"], $col["itemId"] ]);
+      $items_id = $pdo->lastInsertId();
+      for ( $k = 0; $k < count($items_json[$j]->{"mods"}); $k++ ) {
+	      $col = (array) $items_json[$j]->{"mods"}[$k];
+	      if ( !isset($col["taxAmount"]) ) { $col["taxAmount"] = "0"; }
+              if ( !isset($col["itemId"]) ) { $col["itemId"] = "0"; }
+	$stmt = $pdo->prepare("insert into orderItems set agents_id = ?, vendors_id = ?, terminals_id = ?, orders_id = ?, cost = ?, description = ?, group_id = ?, notes = ?, price = ?, taxable = ?, items_id = ?, taxamount = ?, itemid = ?");
+        $stmt->execute([ $agents_id, $vendors_id, $terminals_id, $orderRef, $col["cost"], $col["description"],  $col["group"], $col["notes"], $col["price"], $col["taxable"], $items_id, $col["taxAmount"], $col["itemId"] ]);
+      }
+    }
+  }
+*/
+  ////
+}
+
+if ($hasInventory == false) {
+  for ($i = 0; $i < count($itemdata_json); $i++) {
+    $stmt = $pdo->prepare("select * from items where terminals_id = ? and `desc` = ?");
+    $stmt->execute([$terminals_id, $itemdata_json[$i]->{"description"}]);
+    if ($stmt->rowCount() == 0) {
+      $stmt = $pdo->prepare("insert into items set
+      uuid = ?,
+      agents_id = ?,
+      vendors_id = ?,
+      items_id = ?, 
+      cost = ?,
+      price = ?,
+      notes = ?,
+      upc = ?,
+      taxable = ?,
+      taxrate = ?,
+      `group` = ?,
+      amount_on_hand = ?,
+      enterdate = now(),
+      terminals_id = ?,
+      `desc` = ?
+    ");
+    } else {
+      $stmt = $pdo->prepare("update items set
+      uuid = ?,
+      agents_id = ?,
+      vendors_id = ?,
+      items_id = ?,
+      cost = ?,
+      price = ?,
+      notes = ?,
+      upc = ?,
+      taxable = ?,
+      taxrate = ?,
+      `group` = ?,
+      amount_on_hand = ?,
+      enterdate = now()
+      where terminals_id = ? and `desc` = ?
+    ");
+    }
+    if (!isset($itemdata_json[$i]->{"group"})) {
+      $itemdata_json[$i]->{"group"} = 0;
+    }
+    $stmt->execute([
+      $itemdata_json[$i]->{"iUUID"} ?? null,
+      $agents_id,
+      $vendors_id,
+      $itemdata_json[$i]->{"id"},
+      $itemdata_json[$i]->{"cost"},
+      $itemdata_json[$i]->{"price"},
+      $itemdata_json[$i]->{"notes"},
+      $itemdata_json[$i]->{"upc"},
+      $itemdata_json[$i]->{"taxable"},
+      $itemdata_json[$i]->{"taxRate"},
+      $itemdata_json[$i]->{"group"},
+      $itemdata_json[$i]->{"amountOnHand"},
+      $terminals_id,
+      $itemdata_json[$i]->{"description"}
+    ]);
+  }
+}
+/*for ( $i = 0; $i < count($groups_json); $i++) {
+  $groups_id = $groups_json[$i]->{"id"};
+  $description = $groups_json[$i]->{"description"};
+  $groupType = $groups_json[$i]->{"groupType"};
+  $notes = $groups_json[$i]->{"notes"};
+  $lastMod = $groups_json[$i]->{"lastMod"};
+  $stmt = $pdo->prepare("select * from groups where lastMod = ?");
+  $stmt->execute([ $lastMod ]);
+  if ( $stmt->rowCount() != 0 ) { //should be zero
+    continue;
+  } else {
+    $stmt = $pdo->prepare("insert into groups set agents_id = ?, vendors_id = ?, terminals_id = ?, groups_id = ?, description = ?, groupType = ?, notes = ?, lastMod = ?");
+    $stmt->execute([ $agents_id, $vendors_id, $terminals_id, $groups_id, $description, $groupType, $notes, $lastMod ]);
+  }
+}
+*/
+
+#if($res){
+send_http_status_and_exit("200", "Data was successfully inserted.");
+#} else {
+#send_http_status_and_exit("400",$msgforsqlerror);
+#}
+
+$fp = fopen("/var/www/html/posliteweb/dist/api/log.txt", "a");
+fputs($fp, "xxx");
+fclose($fp);
