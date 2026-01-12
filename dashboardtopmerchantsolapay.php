@@ -1,5 +1,5 @@
 <?php
-// V2
+// V3 - OPTIMIZED (fixes slow response > 1 minute issue)
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
 
@@ -57,64 +57,66 @@ $res = [
     "max_count" => 0
 ];
 
-// The main change is in the merchant selection query
-$olapay_merchants_query = "
-    SELECT DISTINCT accounts.id
-    FROM accounts
-    JOIN terminals ON terminals.vendors_id = accounts.id
-    JOIN terminal_payment_methods ON terminal_payment_methods.terminal_id = terminals.id
-    JOIN payment_methods ON payment_methods.id = terminal_payment_methods.payment_method_id
-    WHERE payment_methods.code = 'olapay'
-    AND accounts.id NOT IN (
-        SELECT DISTINCT accounts.id
-        FROM accounts
-        JOIN terminals ON terminals.vendors_id = accounts.id
-        JOIN terminal_payment_methods ON terminal_payment_methods.terminal_id = terminals.id
-        JOIN payment_methods ON payment_methods.id = terminal_payment_methods.payment_method_id
-        WHERE payment_methods.code = 'olapos'
-    )";  // Exclude merchants that have olapos payment method
+// OPTIMIZED V3 - Performance improvements:
+// 1. Uses generated columns (trans_type, status, amount) instead of JSON_EXTRACT
+// 2. Uses trans_id column (indexed) instead of JSON_EXTRACT
+// 3. Uses EXISTS instead of NOT IN subquery for better performance
+// 4. Single query instead of two separate queries
+// 5. Removed redundant DISTINCT on SELECT
 
-$stmt_merchants = $pdo->query($olapay_merchants_query);
-$olapay_merchant_ids = $stmt_merchants->fetchAll(PDO::FETCH_COLUMN);
-
-// Main query using the new unique_olapay_transactions table
+// Main optimized query
 $query = "
-SELECT DISTINCT
+SELECT 
     accounts.id,
     accounts.companyname AS business,
-    COUNT(DISTINCT JSON_EXTRACT(uot.content, '$.trans_id')) AS transactions,
+    COUNT(DISTINCT uot.trans_id) AS transactions,
     SUM(
         CASE 
-            WHEN JSON_UNQUOTE(JSON_EXTRACT(uot.content, '$.trans_type')) IN ('Refund', 'Return')
-            THEN CAST(JSON_UNQUOTE(JSON_EXTRACT(uot.content, '$.amount')) AS DECIMAL(10,2))
+            WHEN uot.trans_type IN ('Refund', 'Return')
+            THEN uot.amount
             ELSE 0 
         END
     ) AS refund,
     SUM(
         CASE
-            WHEN JSON_EXTRACT(uot.content, '$.trans_id')
-            THEN CAST(JSON_UNQUOTE(JSON_EXTRACT(uot.content, '$.amount')) AS DECIMAL(10,2))
+            WHEN uot.trans_id IS NOT NULL AND uot.trans_id != ''
+            THEN uot.amount
             ELSE 0
         END
     ) - SUM(
         CASE 
-            WHEN JSON_UNQUOTE(JSON_EXTRACT(uot.content, '$.trans_type')) IN ('Refund', 'Return')
-            THEN CAST(JSON_UNQUOTE(JSON_EXTRACT(uot.content, '$.amount')) AS DECIMAL(10,2))
+            WHEN uot.trans_type IN ('Refund', 'Return')
+            THEN uot.amount
             ELSE 0 
         END
     ) AS amount
 FROM unique_olapay_transactions uot
-JOIN terminals ON terminals.serial = uot.serial
-JOIN accounts ON terminals.vendors_id = accounts.id
+INNER JOIN terminals ON terminals.serial = uot.serial
+INNER JOIN accounts ON terminals.vendors_id = accounts.id
 WHERE uot.lastmod > :starttime 
 AND uot.lastmod < :endtime
-AND accounts.id IN (" . implode(',', $olapay_merchant_ids ?: [0]) . ")
-AND JSON_UNQUOTE(JSON_EXTRACT(uot.content, '$.Status')) NOT IN ('', 'FAIL', 'REFUNDED')
-AND JSON_UNQUOTE(JSON_EXTRACT(uot.content, '$.trans_type')) NOT IN ('Return Cash', '', 'Auth')
-AND JSON_EXTRACT(uot.content, '$.trans_id') IS NOT NULL
-AND JSON_EXTRACT(uot.content, '$.trans_id') != ''
+-- Use generated column 'status' instead of JSON_EXTRACT
+AND uot.status NOT IN ('', 'FAIL', 'REFUNDED')
+-- Use generated column 'trans_type' instead of JSON_EXTRACT
+AND uot.trans_type NOT IN ('Return Cash', '', 'Auth')
+-- Use trans_id column instead of JSON_EXTRACT
+AND uot.trans_id IS NOT NULL
+AND uot.trans_id != ''
+-- Filter for olapay-only merchants using EXISTS (more efficient than NOT IN)
+AND EXISTS (
+    SELECT 1 
+    FROM terminal_payment_methods tpm
+    INNER JOIN payment_methods pm ON pm.id = tpm.payment_method_id
+    WHERE tpm.terminal_id = terminals.id AND pm.code = 'olapay'
+)
+AND NOT EXISTS (
+    SELECT 1 
+    FROM terminal_payment_methods tpm
+    INNER JOIN payment_methods pm ON pm.id = tpm.payment_method_id
+    WHERE tpm.terminal_id = terminals.id AND pm.code = 'olapos'
+)
 {$where}
-GROUP BY accounts.id
+GROUP BY accounts.id, accounts.companyname
 ORDER BY amount DESC
 LIMIT 10";
 
