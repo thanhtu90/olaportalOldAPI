@@ -1,0 +1,44 @@
+---
+alwaysApply: true
+---
+
+- if the operation related to databse, always read schema first at db/schema/api2.sql , make sure columns name match if doing raw query
+- accounts.id is other table vendors_id refer to
+- prioritize using uuid
+
+- Try to add lastmod or time range filter when query json table and jsonOlaPay table, because OlaPos app and OlaPay app can send duplicated data which case data in those table has alot of noises.
+
+- Operation explains: for each terminal ( pos device ), it can be installed either OlaPos app or OlaPay app or both.
+  - Whenever client make transaction via OlaPos, it always post a request to store raw data to table json.
+    - If OlaPos transaction is paid via any other payment method than CASH ( i.e: CARD, EBT, Giftcard, ... ), it will send an intent to OlaPay app. OlaPay app will process payment. Whenever OlaPay process transactions, it always post request to store raw data to table jsonOlaPay.
+  - So if a transaction 
+    - Found in table json only ( orderUUID or paymentUUID ) -> this transaction will be counted as OlaPos transactions
+    - Found in both json and jsonOlaPay -> this transaction will be counted as OlaPos transactions
+    - Found in table jsonOlaPay only -> this transaction will be counted as OlaPay transactions
+
+- Table unique_olapay_trasactions is aggregated uniquely from jsonOlaPay, which support count unique, generate export report.
+
+- for OlaPay transactions, command VOID in the content void will reverse the original trans id 
+i.e:
+#1 - order #1 - trans_id #1 - command #1 = sale + requestd_amount = $15 , then order #1 - trans_id #2 - command #2 = void, the final amount should be 0
+#2 - order #1 - trans_id #1 - command #1 = sale + requestd_amount = $15 , then order #1 - trans_id #2 - command #2 = refund + requested_amount = 5,  then order #1 - trans_id #3 - command #3 = void , the final amount should be 15 ( rare case )
+
+- OlaPay transaction raw data was stored in column content of table unique_olapay_transactions
+- content interface:
+ - id: auto increment id store in the android device that run OlaPay app
+ - amount: the amount that device request TSYS for transact
+ - requested_amount: the amount that TSYS approved
+ - original_ref: link to previous transaction using the local auto increment id stored in the android device that run OlaPay app (id), if missing or value is -1 this is the root transaction
+ - trans_id: TSYS generated transaction id, which will be immutable among all transaction of 1 order (.ie: sale order#1 -> trans_id = 1 , refund order#1 - trans_id = 1), except for partial-auth ( partial-auth means original card's balance is less than request amount there are 2 scenarios for partial-auth : 1- OlaPay will void the original transaction then making new transaction -> this will results new trans_id for this order, 2- keep and make another transaction -> this will result split payment )
+
+- example:
+{"acc_token":"","amount":"1.44","auth_code":"TAS466","batch_id":0,"card_payment_type":"V","command":"Return","orderID":"1766981480","original_ref":"9","processor":"TSYS","qty":0,"requested_amount":"1.44","response":"A0014","response_message":"Return requested, Void successful","Status":"PASS","subtotal":"1.44","tax":"0.10","tech_fee_amount":"0.04","tip":"0.00","trans_date":"12\/28\/2025 08:12:12 PM","trans_id":"71647037","trans_type":"Return","user_id":0,"id":10}
+
+{"command":"TipAdjustment","amount":"10.09","auth_code":"","card_payment_type":"","processor":"TSYS","response":"A0000","response_message":"Success","Status":"PASS","trans_id":"71690493","trans_date":"12\/29\/2025 10:06:10 AM","trans_type":"TipAdjustment","orderID":"1767031540","tip":"2.00","tech_fee_amount":"0.39","subtotal":"7.00","tax":"0.70","qty":"0","acc_token":"","requested_amount":"10.09","original_ref":"8","batch_id":"0","user_id":"0","id":"9","original_trans_id":"71690493"}
+
+{"acc_token":"","amount":"1.38","auth_code":"TAS428","batch_id":0,"card_payment_type":"V","command":"Return","orderID":"1766981161","original_ref":"7","processor":"TSYS","qty":0,"requested_amount":"1.38","response":"A0014","response_message":"Return requested, Void successful","Status":"PASS","subtotal":"1.38","tax":"0.10","tech_fee_amount":"0.04","tip":"0.00","trans_date":"12\/28\/2025 08:07:04 PM","trans_id":"71646855","trans_type":"Return","user_id":0,"id":8}
+
+{"command":"Sale","amount":"7.93","auth_code":"062000","card_payment_type":"X","processor":"TSYS","response":"00","response_message":"Success","Status":"PASS","trans_id":"71690371","trans_date":"12\/29\/2025 10:04:05 AM","trans_type":"Sale","orderID":"1767031438","tip":"1.00","tech_fee_amount":"0.33","subtotal":"6.00","tax":"0.60","qty":"1","acc_token":"","requested_amount":"7.93","batch_id":"0","user_id":"0","id":"7"}
+
+- Can not make transaction from 1 terminal and refund or void in another terminal, this will make sure all related transaction has same serial
+
