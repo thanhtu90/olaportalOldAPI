@@ -168,13 +168,16 @@ try {
         $requested_amount = isset($jsonItem['requested_amount']) ? $jsonItem['requested_amount'] : $amount;
         
         // Deduplication Strategy:
-        // Use serial + trans_id + trans_type + status + requested_amount + trans_date
-        // - serial: Terminal serial number (stable)
-        // - trans_id: TSYS generated, unique per transaction chain (never resets)
-        // - trans_type: Sale, TipAdjustment, Void, Return (differentiates transaction types)
-        // - status: PASS, FAIL, etc. (keeps failed/successful separately)
-        // - requested_amount: differentiates transactions with different amounts
-        // - trans_date: handles rare case of same amount at different times (e.g., tip $2 → $3 → $2)
+        // 1. For records WITH trans_id: Use serial + trans_id + trans_type + status + requested_amount + trans_date
+        //    - trans_id: TSYS generated, unique per transaction chain (never resets)
+        //    - trans_type: Sale, TipAdjustment, Void, Return (differentiates transaction types)
+        //    - status: PASS, FAIL, etc. (keeps failed/successful separately)
+        //    - requested_amount: differentiates transactions with different amounts
+        //    - trans_date: handles rare case of same amount at different times
+        // 
+        // 2. For records WITHOUT trans_id (CREATED/polling records): Use serial + order_id + status + lastmod
+        //    - These are polling/status check records that should update instead of creating duplicates
+        //    - Same serial + order_id + status + lastmod = definitely a duplicate
         // 
         // Note: device local 'id' is NOT reliable - it resets when app is reinstalled
         $existingRecord = null;
@@ -198,6 +201,48 @@ try {
                 $trans_date
             ]);
             $existingRecord = $checkDuplicate->fetch(PDO::FETCH_ASSOC);
+        } elseif (!$trans_id && $order_id && $status) {
+            // Secondary check for NULL trans_id records (CREATED/polling/status check records)
+            // These are pre-payment polling records that OlaPay sends repeatedly
+            // Match on: serial + order_id + status + lastmod (same timestamp = duplicate)
+            // This prevents 6000+ duplicate CREATED records from being inserted
+            $checkPollingDuplicate = $pdo->prepare("
+                SELECT id, content, lastmod 
+                FROM unique_olapay_transactions 
+                WHERE serial = ? 
+                AND order_id = ? 
+                AND (trans_id IS NULL OR trans_id = '')
+                AND status = ?
+                AND lastmod = ?
+            ");
+            $checkPollingDuplicate->execute([
+                $params["serial"], 
+                $order_id, 
+                $status,
+                $lastmod
+            ]);
+            $existingRecord = $checkPollingDuplicate->fetch(PDO::FETCH_ASSOC);
+            
+            // If no exact lastmod match, check if there's an existing record for this order_id with same status
+            // that we should update instead of creating a new one
+            if (!$existingRecord) {
+                $checkExistingPolling = $pdo->prepare("
+                    SELECT id, content, lastmod 
+                    FROM unique_olapay_transactions 
+                    WHERE serial = ? 
+                    AND order_id = ? 
+                    AND (trans_id IS NULL OR trans_id = '')
+                    AND status = ?
+                    ORDER BY lastmod DESC
+                    LIMIT 1
+                ");
+                $checkExistingPolling->execute([
+                    $params["serial"], 
+                    $order_id, 
+                    $status
+                ]);
+                $existingRecord = $checkExistingPolling->fetch(PDO::FETCH_ASSOC);
+            }
         }
         
         if ($existingRecord) {

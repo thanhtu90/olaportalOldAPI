@@ -77,44 +77,53 @@ $olapay_merchants_query = "
 $stmt_merchants = $pdo->query($olapay_merchants_query);
 $olapay_merchant_ids = $stmt_merchants->fetchAll(PDO::FETCH_COLUMN);
 
-// Main query using the new unique_olapay_transactions table
+// Main query using CTE to filter out pollution (CREATED status, empty trans_id, etc.)
+// Uses generated columns (status, trans_type, amount) for performance - no JSON extraction needed
 $query = "
-SELECT DISTINCT
+WITH valid_transactions AS (
+    SELECT 
+        uot.serial,
+        uot.trans_id,
+        uot.trans_type,
+        uot.amount,
+        uot.status,
+        uot.lastmod
+    FROM unique_olapay_transactions uot
+    WHERE uot.lastmod > :starttime 
+      AND uot.lastmod < :endtime
+      -- Filter out pollution: CREATED status = incomplete/pending transactions
+      AND uot.status NOT IN ('CREATED', '', 'FAIL', 'REFUNDED')
+      -- Filter out records without valid trans_id
+      AND uot.trans_id IS NOT NULL 
+      AND uot.trans_id != ''
+      -- Filter out invalid transaction types
+      AND uot.trans_type IS NOT NULL
+      AND uot.trans_type NOT IN ('Return Cash', '', 'Auth')
+)
+SELECT 
     accounts.id,
     accounts.companyname AS business,
-    COUNT(DISTINCT JSON_EXTRACT(uot.content, '$.trans_id')) AS transactions,
+    COUNT(DISTINCT vt.trans_id) AS transactions,
     SUM(
         CASE 
-            WHEN JSON_UNQUOTE(JSON_EXTRACT(uot.content, '$.trans_type')) IN ('Refund', 'Return')
-            THEN CAST(JSON_UNQUOTE(JSON_EXTRACT(uot.content, '$.amount')) AS DECIMAL(10,2))
+            WHEN vt.trans_type IN ('Refund', 'Return')
+            THEN vt.amount
             ELSE 0 
         END
     ) AS refund,
-    SUM(
-        CASE
-            WHEN JSON_EXTRACT(uot.content, '$.trans_id')
-            THEN CAST(JSON_UNQUOTE(JSON_EXTRACT(uot.content, '$.amount')) AS DECIMAL(10,2))
-            ELSE 0
-        END
-    ) - SUM(
+    SUM(vt.amount) - SUM(
         CASE 
-            WHEN JSON_UNQUOTE(JSON_EXTRACT(uot.content, '$.trans_type')) IN ('Refund', 'Return')
-            THEN CAST(JSON_UNQUOTE(JSON_EXTRACT(uot.content, '$.amount')) AS DECIMAL(10,2))
+            WHEN vt.trans_type IN ('Refund', 'Return')
+            THEN vt.amount
             ELSE 0 
         END
     ) AS amount
-FROM unique_olapay_transactions uot
-JOIN terminals ON terminals.serial = uot.serial
+FROM valid_transactions vt
+JOIN terminals ON terminals.serial = vt.serial
 JOIN accounts ON terminals.vendors_id = accounts.id
-WHERE uot.lastmod > :starttime 
-AND uot.lastmod < :endtime
-AND accounts.id IN (" . implode(',', $olapay_merchant_ids ?: [0]) . ")
-AND JSON_UNQUOTE(JSON_EXTRACT(uot.content, '$.Status')) NOT IN ('', 'FAIL', 'REFUNDED')
-AND JSON_UNQUOTE(JSON_EXTRACT(uot.content, '$.trans_type')) NOT IN ('Return Cash', '', 'Auth')
-AND JSON_EXTRACT(uot.content, '$.trans_id') IS NOT NULL
-AND JSON_EXTRACT(uot.content, '$.trans_id') != ''
+WHERE accounts.id IN (" . implode(',', $olapay_merchant_ids ?: [0]) . ")
 {$where}
-GROUP BY accounts.id
+GROUP BY accounts.id, accounts.companyname
 ORDER BY amount DESC
 LIMIT 10";
 

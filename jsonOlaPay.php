@@ -116,56 +116,125 @@ try {
         $order_id = isset($json_data['orderID']) ? $json_data['orderID'] : null;
         $trans_date = isset($json_data['trans_date']) ? $json_data['trans_date'] : null;
         $trans_id = isset($json_data['trans_id']) ? $json_data['trans_id'] : null;
+        $trans_type = isset($json_data['trans_type']) ? $json_data['trans_type'] : null;
+        $status = isset($json_data['Status']) ? $json_data['Status'] : null;
+        $requested_amount = isset($json_data['requested_amount']) ? $json_data['requested_amount'] : (isset($json_data['amount']) ? $json_data['amount'] : null);
         
-        // Note: We don't need to explicitly set the computed columns 
-        // (trans_type, amount, status) as they will be automatically 
-        // computed from the content JSON
+        // Deduplication Strategy:
+        // 1. For records WITH trans_id: Use existing INSERT IGNORE (unique constraint handles it)
+        // 2. For records WITHOUT trans_id (CREATED/polling records): Check for existing record and update
+        //    - These are polling/status check records that should update instead of creating duplicates
+        //    - Same serial + order_id + status + lastmod = definitely a duplicate
         
-        // Insert into new table (INSERT IGNORE will skip duplicates)
-        $stmt_unique = $pdo->prepare("
-            INSERT IGNORE INTO unique_olapay_transactions 
-            (
-                serial, 
-                content, 
-                lastmod, 
-                order_id, 
-                trans_date, 
-                trans_id,
-                created_at
-            ) 
-            VALUES (?, ?, ?, ?, ?, ?, NOW())
-        ");
+        $existingRecord = null;
+        $shouldInsert = true;
         
-        $stmt_unique->execute([
-            $serial,
-            $content,
-            $lastmod,
-            $order_id,
-            $trans_date,
-            $trans_id
-        ]);
-
-        // Verify the insert and log any computation errors
-        if ($stmt_unique->rowCount() > 0) {
-            // Optional: Verify computed columns are working as expected
-            $last_id = $pdo->lastInsertId();
-            $verify_stmt = $pdo->prepare("
-                SELECT trans_type, amount, status 
+        if ($trans_id && $trans_type && $status && $trans_date) {
+            // For records with trans_id, check for exact duplicates
+            $checkDuplicate = $pdo->prepare("
+                SELECT id, content, lastmod 
                 FROM unique_olapay_transactions 
-                WHERE id = ?
+                WHERE serial = ? AND trans_id = ? AND trans_type = ? AND status = ?
+                AND JSON_UNQUOTE(JSON_EXTRACT(content, '$.requested_amount')) = ?
+                AND trans_date = ?
             ");
-            $verify_stmt->execute([$last_id]);
-            $result = $verify_stmt->fetch(PDO::FETCH_ASSOC);
+            $checkDuplicate->execute([
+                $serial, 
+                $trans_id, 
+                $trans_type, 
+                $status, 
+                (string)$requested_amount,
+                $trans_date
+            ]);
+            $existingRecord = $checkDuplicate->fetch(PDO::FETCH_ASSOC);
+        } elseif (!$trans_id && $order_id && $status) {
+            // For NULL trans_id records (CREATED/polling/status check records)
+            // These are pre-payment polling records that OlaPay sends repeatedly
+            // Check for existing record with same serial + order_id + status
+            $checkPollingDuplicate = $pdo->prepare("
+                SELECT id, content, lastmod 
+                FROM unique_olapay_transactions 
+                WHERE serial = ? 
+                AND order_id = ? 
+                AND (trans_id IS NULL OR trans_id = '')
+                AND status = ?
+                ORDER BY lastmod DESC
+                LIMIT 1
+            ");
+            $checkPollingDuplicate->execute([
+                $serial, 
+                $order_id, 
+                $status
+            ]);
+            $existingRecord = $checkPollingDuplicate->fetch(PDO::FETCH_ASSOC);
+        }
+        
+        if ($existingRecord) {
+            $shouldInsert = false;
             
-            if ($result['trans_type'] === null || $result['amount'] === null || $result['status'] === null) {
-                error_log("Warning: Computed columns may have null values for ID: $last_id");
+            // Only update if this record has newer data (higher lastmod)
+            if ($lastmod > $existingRecord['lastmod']) {
+                $updateUnique = $pdo->prepare("
+                    UPDATE unique_olapay_transactions 
+                    SET content = ?, lastmod = ?, trans_date = ?, order_id = ?
+                    WHERE id = ?
+                ");
+                $updateUnique->execute([$content, $lastmod, $trans_date, $order_id, $existingRecord['id']]);
+                
+                if ($updateUnique->rowCount() > 0) {
+                    error_log("Updated existing unique_olapay_transactions record ID: " . $existingRecord['id']);
+                }
+            }
+            // If same or older lastmod, skip silently (it's a duplicate)
+        }
+        
+        if ($shouldInsert) {
+            // Insert into new table (INSERT IGNORE will skip duplicates for records with trans_id)
+            $stmt_unique = $pdo->prepare("
+                INSERT IGNORE INTO unique_olapay_transactions 
+                (
+                    serial, 
+                    content, 
+                    lastmod, 
+                    order_id, 
+                    trans_date, 
+                    trans_id,
+                    created_at
+                ) 
+                VALUES (?, ?, ?, ?, ?, ?, NOW())
+            ");
+            
+            $stmt_unique->execute([
+                $serial,
+                $content,
+                $lastmod,
+                $order_id,
+                $trans_date,
+                $trans_id
+            ]);
+
+            // Verify the insert and log any computation errors
+            if ($stmt_unique->rowCount() > 0) {
+                // Optional: Verify computed columns are working as expected
+                $last_id = $pdo->lastInsertId();
+                $verify_stmt = $pdo->prepare("
+                    SELECT trans_type, amount, status 
+                    FROM unique_olapay_transactions 
+                    WHERE id = ?
+                ");
+                $verify_stmt->execute([$last_id]);
+                $result = $verify_stmt->fetch(PDO::FETCH_ASSOC);
+                
+                if ($result['trans_type'] === null || $result['amount'] === null || $result['status'] === null) {
+                    error_log("Warning: Computed columns may have null values for ID: $last_id");
+                }
             }
         }
     }
 } catch (Exception $e) {
     // Enhanced error logging
     error_log("Error in jsonOlaPay.php: " . $e->getMessage());
-    error_log("JSON Content: " . substr($content, 0, 1000)); // Log first 1000 chars of content
+    error_log("JSON Content: " . substr($content ?? '', 0, 1000)); // Log first 1000 chars of content
     error_log("Stack trace: " . $e->getTraceAsString());
 }
 
