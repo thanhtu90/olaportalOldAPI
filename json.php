@@ -777,6 +777,21 @@ $fp = fopen("./tmp/aa.txt", "a");
 fputs($fp, time() . " 開始處理資料\n");
 fclose($fp);
 
+// Build a map of orderUuid/orderReference -> order total from orders_json
+// This allows us to get the CORRECT full order total instead of individual payment total
+$orderTotalMap = array();
+for ($j = 0; $j < count($orders_json); $j++) {
+  $oUUID = $orders_json[$j]->{"oUUID"} ?? ($orders_json[$j]->{"uuid"} ?? null);
+  $oRef = $orders_json[$j]->{"id"} ?? null;
+  $oTotal = $orders_json[$j]->{"total"} ?? null;
+  if ($oUUID !== null && $oTotal !== null) {
+    $orderTotalMap["uuid_" . $oUUID] = $oTotal;
+  }
+  if ($oRef !== null && $oTotal !== null) {
+    $orderTotalMap["ref_" . $oRef] = $oTotal;
+  }
+}
+
 #必須先掃一次傳上來的payment; 如果payDate已經存在，就要把order, orderPayments, orderItems都清空, 再重新插入; 這邊是因應orderPayments在refund後lastmod改變但payrDate不變
 for ($i = 0; $i < count($payments); $i++) {
   $payDate = strtotime($payments[$i]->{"payDate"});
@@ -798,8 +813,11 @@ for ($i = 0; $i < count($payments); $i++) {
         print("existing_order[\"lastMod\"]: " . $existing_order["lastMod"]);
         if ($payments[$i]->{"lastMod"} > $existing_order["lastMod"]) {
           print("Update order tip / total / techfee" . " \n");
+          // Use order total from orders_json (not payment total) - fixes split payment bug
+          $orderTotalFromJson = $orderTotalMap["uuid_" . $orderUuid] ?? $payments[$i]->{"total"};
+          print("Using order total from orders_json: " . $orderTotalFromJson . " (payment total was: " . $payments[$i]->{"total"} . ")\n");
           $stmt = $pdo->prepare("update orders set tip = ?, total = ?, tech_fee = ? where id = ?");
-          $stmt->execute([(float)$payments[$i]->{"tips"}, (float)$payments[$i]->{"total"}, (float)$payments[$i]->{"techfee"}, $existing_order["id"]]);
+          $stmt->execute([(float)$payments[$i]->{"tips"}, (float)$orderTotalFromJson, (float)$payments[$i]->{"techfee"}, $existing_order["id"]]);
         }
         print("End checking order tip / total / techfee" . " \n");
       } catch (Exception $e) {
@@ -836,8 +854,11 @@ for ($i = 0; $i < count($payments); $i++) {
         print("row2[\"lastMod\"]: " . $row2["lastMod"]);
         if ($payments[$i]->{"lastMod"} > $row2["lastMod"]) {
           print("Update order tip / total / techfee" . " \n");
+          // Use order total from orders_json (not payment total) - fixes split payment bug
+          $orderTotalFromJson = $orderTotalMap["ref_" . $orderReference] ?? $payments[$i]->{"total"};
+          print("Using order total from orders_json: " . $orderTotalFromJson . " (payment total was: " . $payments[$i]->{"total"} . ")\n");
           $stmt = $pdo->prepare("update orders set tip = ?, total = ?, tech_fee = ? where id = ?");
-          $stmt->execute([(float)$payments[$i]->{"tips"}, (float)$payments[$i]->{"total"}, (float)$payments[$i]->{"techfee"}, $row2["id"]]);
+          $stmt->execute([(float)$payments[$i]->{"tips"}, (float)$orderTotalFromJson, (float)$payments[$i]->{"techfee"}, $row2["id"]]);
         }
         print("End checking order tip / total / techfee" . " \n");
       } catch (Exception $e) {
