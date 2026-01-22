@@ -398,18 +398,22 @@ function processOrderItemsForOrder($pdo, $items_json, $orderReference, $order, $
         print_r("DEBUG: Item $j - orderRef: $itemOrderRef vs current orderRef: $orderReference" . " \n");
         
         if ($orderReference == $itemOrderRef) {
-            // Deduplicate by itemUuid to prevent duplicate inserts
+            // Deduplicate by itemUuid + price to prevent duplicate inserts
+            // BUT allow same item with different price (dual pricing: cash vs card)
+            // Round price to 2 decimal places for consistent comparison
             $itemUuid = $isOnlinePlatform 
                 ? ($items_json[$j]->{"orderItem"}->{"uuid"} ?? null) 
                 : ($items_json[$j]->{"orderItem"}->{"iUUID"} ?? null);
+            $itemPrice = round((float)($items_json[$j]->{"orderItem"}->{"price"} ?? 0), 2);
+            $dedupeKey = $itemUuid . '_' . $itemPrice;
             
-            if ($itemUuid !== null && isset($processed_item_uuids[$itemUuid])) {
-                print_r("DEBUG: Skipping duplicate itemUuid: $itemUuid for orderReference: $orderReference" . " \n");
+            if ($itemUuid !== null && isset($processed_item_uuids[$dedupeKey])) {
+                print_r("DEBUG: Skipping duplicate itemUuid+price: $dedupeKey for orderReference: $orderReference" . " \n");
                 continue;
             }
             
             if ($itemUuid !== null) {
-                $processed_item_uuids[$itemUuid] = true;
+                $processed_item_uuids[$dedupeKey] = true;
             }
             print_r("DEBUG: Match found - processing item $j for orderReference: $orderReference" . " \n");
             
