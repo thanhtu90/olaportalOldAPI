@@ -137,7 +137,7 @@ SELECT u.id, u.lastmod, u.content, u.trans_id, u.trans_type,
        JSON_UNQUOTE(JSON_EXTRACT(u.content, '$.requested_amount')) as requested_amount
 FROM unique_olapay_transactions u
 WHERE u.serial = ?
-  AND u.status NOT IN ('', 'FAIL', 'REFUNDED')
+  AND u.status NOT IN ('', 'FAIL')
   AND u.trans_type NOT IN ('Return Cash', '', 'Auth')
   -- Find all transactions with the same trans_id (Sale, TipAdjustment, Void, Return share trans_id)
   AND u.trans_id IN ($placeholders)
@@ -172,7 +172,7 @@ SELECT u.id, u.lastmod, u.content, u.trans_id, u.trans_type,
 FROM unique_olapay_transactions u
 WHERE u.serial = ?
   AND u.lastmod < ?
-  AND u.status NOT IN ('', 'FAIL', 'REFUNDED')
+  AND u.status NOT IN ('', 'FAIL')
   AND u.trans_type NOT IN ('Return Cash', '', 'Auth')
   -- Find original sales by their trans_id (uses indexed column)
   AND u.trans_id IN ($placeholders)
