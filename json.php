@@ -801,8 +801,9 @@ for ($i = 0; $i < count($payments); $i++) {
   $payDate = strtotime($payments[$i]->{"payDate"});
 
   # Check if has orderUuid and paymentUuid -> if order exist, update orderUuid if paymentUuid is not null -> update payment
+  # Online orders use "paymentUuid", POS orders use "pUUID"
   $orderUuid = $payments[$i]->{"orderUuid"} ?? null;
-  $paymentUuid = $payments[$i]->{"paymentUuid"} ?? null;
+  $paymentUuid = $payments[$i]->{"paymentUuid"} ?? $payments[$i]->{"pUUID"} ?? null;
 
   if($orderUuid && $paymentUuid){
     // This is for new build of the pos
@@ -829,8 +830,14 @@ for ($i = 0; $i < count($payments); $i++) {
       }
     }
 
+    // Check for existing payment by paymentUuid first, then fallback to orderUuid + payDate if paymentUuid is null in DB
     $stmt = $pdo->prepare("select * from ordersPayments where terminals_id = ? and payDate = ? and paymentUuid = ?");
     $stmt->execute([$terminals_id, $payDate, $paymentUuid]);
+    if ($stmt->rowCount() == 0) {
+      // Fallback: check by orderUuid + payDate in case existing payment has paymentUuid = null
+      $stmt = $pdo->prepare("select * from ordersPayments where terminals_id = ? and payDate = ? and orderUuid = ? and (paymentUuid IS NULL OR paymentUuid = ?)");
+      $stmt->execute([$terminals_id, $payDate, $orderUuid, $paymentUuid]);
+    }
     if ($stmt->rowCount() != 0) {
       $row = $stmt->fetch();
       $existing_payment = $row["id"];
@@ -839,8 +846,10 @@ for ($i = 0; $i < count($payments); $i++) {
       $new_total = $payments[$i]->{"total"};
       $new_refund = $payments[$i]->{"refund"};
       $new_originalTotal = $payments[$i]->{"orgTotal"} ?? null;
-      $stmt2 = $pdo->prepare("update ordersPayments set amtPaid = ?, total = ?, refund = ?, tips = ?, lastMod = ?, originalTotal = ? where id = ?");
-      $stmt2->execute([(float)$new_amtPaid, (float)$new_total, (float)$new_refund, (float)$new_tips, $payments[$i]->{"lastMod"}, $new_originalTotal, $existing_payment]);
+      // Update payment including setting paymentUuid if it was null
+      $stmt2 = $pdo->prepare("update ordersPayments set paymentUuid = ?, amtPaid = ?, total = ?, refund = ?, tips = ?, lastMod = ?, originalTotal = ? where id = ?");
+      $stmt2->execute([$paymentUuid, (float)$new_amtPaid, (float)$new_total, (float)$new_refund, (float)$new_tips, $payments[$i]->{"lastMod"}, $new_originalTotal, $existing_payment]);
+      print_r("Updated existing payment ID {$existing_payment} with paymentUuid: {$paymentUuid}\n");
     }
   }else{ 
     // This is for old build of the pos
@@ -1172,32 +1181,74 @@ for ($i = 0; $i < count($payments); $i++) {
     
 
   }
-  $payment_uuid = $payments[$i]->{"pUUID"} ?? null;
+  // Get paymentUuid from payload - check both paymentUuid and pUUID for backward compatibility
+  $payment_uuid = $payments[$i]->{"paymentUuid"} ?? $payments[$i]->{"pUUID"} ?? null;
   $olapayApprovalId = $payments[$i]->{"olapayApprovalId"} ?? null;
   #echo $amtPaid . " " . $total . " " . $lastMod . " " . $orderRef;
   // Check for duplicate payment by paymentUuid and orderUuid only (not terminals_id)
   // This prevents duplicate inserts when multiple terminals sync the same payment
-  $stmt = $pdo->prepare("select * from ordersPayments where paymentUuid = ? and orderUuid = ?");
-  $stmt->execute([$payment_uuid, $order_uuid]);
+  // Handle NULL paymentUuid case - use IS NULL for proper SQL comparison
+  if ($payment_uuid !== null) {
+    // First check by paymentUuid + orderUuid
+    $stmt = $pdo->prepare("select * from ordersPayments where paymentUuid = ? and orderUuid = ?");
+    $stmt->execute([$payment_uuid, $order_uuid]);
+    // If not found, check for existing payment with NULL paymentUuid (migration case)
+    if ($stmt->rowCount() == 0) {
+      $stmt = $pdo->prepare("select * from ordersPayments where paymentUuid IS NULL and orderUuid = ? and payDate = ? and orderReference = ?");
+      $stmt->execute([$order_uuid, $payDate, $orderRef]);
+    }
+  } else {
+    // Fallback deduplication when paymentUuid is null - use orderUuid + payDate + orderReference
+    $stmt = $pdo->prepare("select * from ordersPayments where paymentUuid IS NULL and orderUuid = ? and payDate = ? and orderReference = ?");
+    $stmt->execute([$order_uuid, $payDate, $orderRef]);
+  }
   if ($stmt->rowCount() != 0) { //should be zero
     // Payment exists - check if we should update with newer data (e.g., refund info)
     $existing_payment = $stmt->fetch();
+    $existing_payment_id = $existing_payment["id"];
+    $existing_payment_uuid = $existing_payment["paymentUuid"];
+    
+    // Determine if we need to update (either newer lastMod or paymentUuid needs to be set)
+    $needs_update = false;
     if ($payments[$i]->{"lastMod"} > $existing_payment["lastMod"]) {
+      $needs_update = true;
+    }
+    // Also update if paymentUuid is null in DB but we have it in payload
+    if ($payment_uuid !== null && $existing_payment_uuid === null) {
+      $needs_update = true;
+    }
+    
+    if ($needs_update) {
       $new_originalTotal = $payments[$i]->{"orgTotal"} ?? null;
-      $stmt_update = $pdo->prepare("update ordersPayments set amtPaid = ?, total = ?, refund = ?, tips = ?, lastMod = ?, originalTotal = ? where paymentUuid = ? and orderUuid = ?");
-      $stmt_update->execute([
-        (float)$amtPaid, 
-        (float)$total, 
-        (float)$refund, 
-        (float)$tips, 
-        $lastMod, 
-        $new_originalTotal,
-        $payment_uuid,
-        $order_uuid
-      ]);
-      print_r("Updated payment for orderUuid: " . $order_uuid . " and paymentUuid: " . $payment_uuid . " with newer lastMod \n");
+      // Update payment including setting paymentUuid if it was null
+      if ($payment_uuid !== null) {
+        // Update by ID to ensure we update the correct payment
+        $stmt_update = $pdo->prepare("update ordersPayments set paymentUuid = ?, amtPaid = ?, total = ?, refund = ?, tips = ?, lastMod = ?, originalTotal = ? where id = ?");
+        $stmt_update->execute([
+          $payment_uuid,
+          (float)$amtPaid, 
+          (float)$total, 
+          (float)$refund, 
+          (float)$tips, 
+          $lastMod, 
+          $new_originalTotal,
+          $existing_payment_id
+        ]);
+      } else {
+        $stmt_update = $pdo->prepare("update ordersPayments set amtPaid = ?, total = ?, refund = ?, tips = ?, lastMod = ?, originalTotal = ? where id = ?");
+        $stmt_update->execute([
+          (float)$amtPaid, 
+          (float)$total, 
+          (float)$refund, 
+          (float)$tips, 
+          $lastMod, 
+          $new_originalTotal,
+          $existing_payment_id
+        ]);
+      }
+      print_r("Updated payment ID {$existing_payment_id} for orderUuid: " . $order_uuid . " and paymentUuid: " . ($payment_uuid ?? "NULL") . " with newer lastMod \n");
     } else {
-      print_r("Payment already exists for orderUuid: " . $order_uuid . " and paymentUuid: " . $payment_uuid . " \n");
+      print_r("Payment already exists for orderUuid: " . $order_uuid . " and paymentUuid: " . ($payment_uuid ?? "NULL") . " \n");
     }
     continue;
   } else {
