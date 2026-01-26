@@ -23,24 +23,28 @@ use \Firebase\JWT\JWT;
 
 #get payment methods for vendor
 if ($_SERVER["REQUEST_METHOD"] == "GET" && isset($_REQUEST["vendors_id"])) {
+    // Optimized query: Using GROUP BY instead of DISTINCT for better performance
+    // Original join order is optimal for MySQL query planner
     $stmt = $pdo->prepare("
-        SELECT DISTINCT pm.name, pm.code 
+        SELECT pm.name, pm.code 
         FROM payment_methods pm
         INNER JOIN terminal_payment_methods tpm ON pm.id = tpm.payment_method_id
         INNER JOIN terminals t ON tpm.terminal_id = t.id
         WHERE t.vendors_id = ?
+        GROUP BY pm.id, pm.name, pm.code
         ORDER BY pm.name
     ");
 
     $stmt->execute([$_REQUEST["vendors_id"]]);
 
+    // Use fetchAll() instead of while loop for better performance
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
     $res = array();
-    while ($row = $stmt->fetch()) {
-        $entry = array(
+    foreach ($rows as $row) {
+        $res[] = array(
             "name" => $row["name"],
             "code" => $row["code"]
         );
-        array_push($res, $entry);
     }
 
     send_http_status_and_exit("200", json_encode($res));
