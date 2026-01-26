@@ -1097,7 +1097,8 @@ foreach ($json_records as $record) {
         $orderId = $payment_data->orderID ?? '';
         
         // Get payment and order UUIDs
-        $payment_uuid = $payment_data->pUUID ?? null;
+        // Online orders use "paymentUuid", POS orders use "pUUID"
+        $payment_uuid = $payment_data->paymentUuid ?? $payment_data->pUUID ?? null;
         $olapayApprovalId = $payment_data->olapayApprovalId ?? null;
         
         if ($isOnlinePlatform) {
@@ -1115,8 +1116,10 @@ foreach ($json_records as $record) {
         }
 
         // Check if this payment UUID was already processed during this runtime
-        if (!empty($payment_uuid) && isset($processed_payment_uuids[$payment_uuid])) {
-            echo "❌ SKIPPED: Payment UUID $payment_uuid was already processed during this runtime.\n";
+        // Use orderUuid + payDate as fallback key if payment_uuid is null
+        $runtime_dedup_key = $payment_uuid ?? ($order_uuid . '_' . $payDate);
+        if (isset($processed_payment_uuids[$runtime_dedup_key])) {
+            echo "❌ SKIPPED: Payment (UUID: " . ($payment_uuid ?? 'NULL') . ") was already processed during this runtime.\n";
             $payments_skipped++;
             continue;
         }
@@ -1137,27 +1140,60 @@ foreach ($json_records as $record) {
         
         $orderRef = $order_ref_row['id'];
         
-        // Check if this payment already exists (check by paymentUuid ONLY to prevent duplicates from different terminals)
+        // Check if this payment already exists
+        // Check by paymentUuid + orderUuid first, then fallback to orderUuid + payDate if paymentUuid is null in DB
         $payment_check_start = microtime(true);
-        $stmt_payment_check = $pdo->prepare("SELECT * FROM ordersPayments WHERE paymentUuid = ?");
-        $stmt_payment_check->execute([$payment_uuid]);
+        if ($payment_uuid !== null) {
+            // First check by paymentUuid + orderUuid
+            $stmt_payment_check = $pdo->prepare("SELECT * FROM ordersPayments WHERE paymentUuid = ? AND orderUuid = ?");
+            $stmt_payment_check->execute([$payment_uuid, $order_uuid]);
+            // If not found, check for existing payment with NULL paymentUuid (migration case)
+            if ($stmt_payment_check->rowCount() == 0) {
+                $stmt_payment_check = $pdo->prepare("SELECT * FROM ordersPayments WHERE paymentUuid IS NULL AND orderUuid = ? AND payDate = ? AND orderReference = ?");
+                $stmt_payment_check->execute([$order_uuid, $payDate, $orderRef]);
+            }
+        } else {
+            // Fallback deduplication when paymentUuid is null - use orderUuid + payDate + orderReference
+            $stmt_payment_check = $pdo->prepare("SELECT * FROM ordersPayments WHERE paymentUuid IS NULL AND orderUuid = ? AND payDate = ? AND orderReference = ?");
+            $stmt_payment_check->execute([$order_uuid, $payDate, $orderRef]);
+        }
         $payment_check_time = round((microtime(true) - $payment_check_start) * 1000, 2);
         echo "Payment check: {$payment_check_time}ms | ";
         
         if ($stmt_payment_check->rowCount() > 0) {
-            $payment_update_time = round((microtime(true) - $payment_check_start) * 1000, 2);
-            // update tips, total, refund, lastMod (match by paymentUuid only for consistency)
-            $stmt_update_payment = $pdo->prepare("UPDATE ordersPayments SET amtPaid = ?, tips = ?, total = ?, refund = ?, lastMod = ? WHERE paymentUuid = ?");
-            $stmt_update_payment->execute([(float)$amtPaid, (float)$tips, (float)$total, (float)$refund, $lastMod, $payment_uuid]);
-            // log raw query
-            echo "Raw query: " . $stmt_update_payment->queryString . "\n";
-            echo "Params: " . implode(', ', [$amtPaid, $tips, $total, $refund, $lastMod, $payment_uuid]) . "\n";
-            echo "✅ SUCCESS: Payment updated in {$payment_update_time}ms\n";
+            $existing_payment = $stmt_payment_check->fetch();
+            $existing_payment_id = $existing_payment['id'];
+            $existing_payment_uuid = $existing_payment['paymentUuid'];
             
-            // Record this payment UUID as processed during runtime
-            if (!empty($payment_uuid)) {
-                $processed_payment_uuids[$payment_uuid] = true;
+            // Determine if we need to update (either newer lastMod or paymentUuid needs to be set)
+            $needs_update = false;
+            if ($lastMod > $existing_payment['lastMod']) {
+                $needs_update = true;
             }
+            // Also update if paymentUuid is null in DB but we have it in payload
+            if ($payment_uuid !== null && $existing_payment_uuid === null) {
+                $needs_update = true;
+            }
+            
+            if ($needs_update) {
+                $payment_update_time = round((microtime(true) - $payment_check_start) * 1000, 2);
+                $originalTotal = $payment_data->orgTotal ?? null;
+                // Update payment including setting paymentUuid if it was null
+                if ($payment_uuid !== null) {
+                    // Update by ID to ensure we update the correct payment
+                    $stmt_update_payment = $pdo->prepare("UPDATE ordersPayments SET paymentUuid = ?, amtPaid = ?, tips = ?, total = ?, refund = ?, lastMod = ?, originalTotal = ? WHERE id = ?");
+                    $stmt_update_payment->execute([$payment_uuid, (float)$amtPaid, (float)$tips, (float)$total, (float)$refund, $lastMod, $originalTotal, $existing_payment_id]);
+                } else {
+                    $stmt_update_payment = $pdo->prepare("UPDATE ordersPayments SET amtPaid = ?, tips = ?, total = ?, refund = ?, lastMod = ?, originalTotal = ? WHERE id = ?");
+                    $stmt_update_payment->execute([(float)$amtPaid, (float)$tips, (float)$total, (float)$refund, $lastMod, $originalTotal, $existing_payment_id]);
+                }
+                echo "✅ SUCCESS: Payment updated (ID: $existing_payment_id) in {$payment_update_time}ms\n";
+            } else {
+                echo "✅ Payment already exists (ID: $existing_payment_id), no update needed\n";
+            }
+            
+            // Record this payment as processed during runtime
+            $processed_payment_uuids[$runtime_dedup_key] = true;
             
             $payments_skipped++;
             continue;
@@ -1171,6 +1207,7 @@ foreach ($json_records as $record) {
             $editTerminalSerial = $payment_data->editTermSerial ?? null;
             $editEmployeeId = $payment_data->editEmployeeId ?? null;
             $editEmployeePIN = $payment_data->editEmployeePIN ?? null;
+            $originalTotal = $payment_data->orgTotal ?? null;
             
             $stmt_insert_payment = $pdo->prepare("INSERT INTO ordersPayments SET 
                 paymentUuid = ?, 
@@ -1191,6 +1228,7 @@ foreach ($json_records as $record) {
                 lastMod = ?, 
                 employee_id = ?,
                 status = ?,
+                originalTotal = ?,
                 editTerminalSerial = ?,
                 editEmployeeId = ?,
                 editEmployeePIN = ?");
@@ -1214,6 +1252,7 @@ foreach ($json_records as $record) {
                 $lastMod,
                 $employee_id,
                 0, // default status
+                $originalTotal,
                 $editTerminalSerial,
                 $editEmployeeId,
                 $editEmployeePIN
@@ -1224,10 +1263,8 @@ foreach ($json_records as $record) {
             $payments_created++;
             echo "✅ Created payment with ID: $new_payment_id in {$payment_insert_time}ms\n";
             
-            // Record this payment UUID as processed during runtime
-            if (!empty($payment_uuid)) {
-                $processed_payment_uuids[$payment_uuid] = true;
-            }
+            // Record this payment as processed during runtime
+            $processed_payment_uuids[$runtime_dedup_key] = true;
             
             // Delete pending order if exists
             if ($order_uuid) {
