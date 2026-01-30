@@ -62,6 +62,8 @@ if ( $_SERVER["REQUEST_METHOD"] == "GET") {
 	$entry["mac"] = $row["mac"];
 	$entry["fiserv_merch_id"] = $row["fiserv_merch_id"];
 	$entry["merchid_ach"] = $row["merchid_ach"];
+	$entry["global_merchantware_site_id"] = $row["global_merchantware_site_id"];
+	$entry["global_merchantware_key"] = $row["global_merchantware_key"];
         #$stmt2 = $pdo->prepare("select * from accounts where id = ?");
         #$stmt2->execute([ $row["accounts_id"] ]);
         #$row2 = $stmt2->fetch();
@@ -84,10 +86,12 @@ if ( $_SERVER["REQUEST_METHOD"] == "POST") {
       "terminal_nbr",
       "mac"
     ]);
-    // Get fiserv_merch_id and merchid_ach from body if present, else set to null
+    // Get optional fields from body if present, else set to null
     $jsonObj = json_decode(file_get_contents("php://input"), true);
     $fiserv_merch_id = isset($jsonObj['fiserv_merch_id']) ? htmlspecialchars($jsonObj['fiserv_merch_id']) : null;
     $merchid_ach = isset($jsonObj['merchid_ach']) ? htmlspecialchars($jsonObj['merchid_ach']) : null;
+    $global_merchantware_site_id = isset($jsonObj['global_merchantware_site_id']) ? htmlspecialchars($jsonObj['global_merchantware_site_id']) : null;
+    $global_merchantware_key = isset($jsonObj['global_merchantware_key']) ? htmlspecialchars($jsonObj['global_merchantware_key']) : null;
     $stmt = $pdo->prepare("update accounts set
       processor = ?,
       cust_nbr = ?,
@@ -96,7 +100,9 @@ if ( $_SERVER["REQUEST_METHOD"] == "POST") {
       terminal_nbr = ?,
       mac = ?,
       fiserv_merch_id = ?,
-      merchid_ach = ?
+      merchid_ach = ?,
+      global_merchantware_site_id = ?,
+      global_merchantware_key = ?
     where id = ?
     ");
     $rtn = $stmt->execute([
@@ -108,6 +114,8 @@ if ( $_SERVER["REQUEST_METHOD"] == "POST") {
 	$params["mac"],
 	$fiserv_merch_id,
 	$merchid_ach,
+	$global_merchantware_site_id,
+	$global_merchantware_key,
         $params["id"]
     ]);
     if ( $rtn ) {
