@@ -846,9 +846,11 @@ for ($i = 0; $i < count($payments); $i++) {
       $new_total = $payments[$i]->{"total"};
       $new_refund = $payments[$i]->{"refund"};
       $new_originalTotal = $payments[$i]->{"orgTotal"} ?? null;
+      $new_payment_type_code = isset($payments[$i]->{"other_paytype_code"}) ? $payments[$i]->{"other_paytype_code"} : null;
+      $new_payment_type_name = isset($payments[$i]->{"other_paytype_name"}) ? $payments[$i]->{"other_paytype_name"} : null;
       // Update payment including setting paymentUuid if it was null
-      $stmt2 = $pdo->prepare("update ordersPayments set paymentUuid = ?, amtPaid = ?, total = ?, refund = ?, tips = ?, lastMod = ?, originalTotal = ? where id = ?");
-      $stmt2->execute([$paymentUuid, (float)$new_amtPaid, (float)$new_total, (float)$new_refund, (float)$new_tips, $payments[$i]->{"lastMod"}, $new_originalTotal, $existing_payment]);
+      $stmt2 = $pdo->prepare("update ordersPayments set paymentUuid = ?, amtPaid = ?, total = ?, refund = ?, tips = ?, lastMod = ?, originalTotal = ?, payment_type_code = ?, payment_type_name = ? where id = ?");
+      $stmt2->execute([$paymentUuid, (float)$new_amtPaid, (float)$new_total, (float)$new_refund, (float)$new_tips, $payments[$i]->{"lastMod"}, $new_originalTotal, $new_payment_type_code, $new_payment_type_name, $existing_payment]);
       print_r("Updated existing payment ID {$existing_payment} with paymentUuid: {$paymentUuid}\n");
     }
   }else{ 
@@ -893,8 +895,10 @@ for ($i = 0; $i < count($payments); $i++) {
       $new_total = $payments[$i]->{"total"};
       $new_refund = $payments[$i]->{"refund"};
       $new_originalTotal = $payments[$i]->{"orgTotal"} ?? null;
-      $stmt2 = $pdo->prepare("update ordersPayments set amtPaid = ?, total = ?, refund = ?, tips = ?, lastMod = ?, originalTotal = ? where id = ?");
-      $stmt2->execute([(float)$new_amtPaid, (float)$new_total, (float)$new_refund, (float)$new_tips, $payments[$i]->{"lastMod"}, $new_originalTotal, $id]);
+      $new_payment_type_code = isset($payments[$i]->{"other_paytype_code"}) ? $payments[$i]->{"other_paytype_code"} : null;
+      $new_payment_type_name = isset($payments[$i]->{"other_paytype_name"}) ? $payments[$i]->{"other_paytype_name"} : null;
+      $stmt2 = $pdo->prepare("update ordersPayments set amtPaid = ?, total = ?, refund = ?, tips = ?, lastMod = ?, originalTotal = ?, payment_type_code = ?, payment_type_name = ? where id = ?");
+      $stmt2->execute([(float)$new_amtPaid, (float)$new_total, (float)$new_refund, (float)$new_tips, $payments[$i]->{"lastMod"}, $new_originalTotal, $new_payment_type_code, $new_payment_type_name, $id]);
       #$orderReference = $row["orderReference"];
       #$stmt = $pdo->prepare("delete from ordersPayments where terminals_id = ? and id = ?");
       #$stmt->execute([ $terminals_id, $id ]);
@@ -1184,6 +1188,8 @@ for ($i = 0; $i < count($payments); $i++) {
   // Get paymentUuid from payload - check both paymentUuid and pUUID for backward compatibility
   $payment_uuid = $payments[$i]->{"paymentUuid"} ?? $payments[$i]->{"pUUID"} ?? null;
   $olapayApprovalId = $payments[$i]->{"olapayApprovalId"} ?? null;
+  $payment_type_code = isset($payments[$i]->{"other_paytype_code"}) ? $payments[$i]->{"other_paytype_code"} : null;
+  $payment_type_name = isset($payments[$i]->{"other_paytype_name"}) ? $payments[$i]->{"other_paytype_name"} : null;
   #echo $amtPaid . " " . $total . " " . $lastMod . " " . $orderRef;
   // Check for duplicate payment by paymentUuid and orderUuid only (not terminals_id)
   // This prevents duplicate inserts when multiple terminals sync the same payment
@@ -1223,7 +1229,7 @@ for ($i = 0; $i < count($payments); $i++) {
       // Update payment including setting paymentUuid if it was null
       if ($payment_uuid !== null) {
         // Update by ID to ensure we update the correct payment
-        $stmt_update = $pdo->prepare("update ordersPayments set paymentUuid = ?, amtPaid = ?, total = ?, refund = ?, tips = ?, lastMod = ?, originalTotal = ? where id = ?");
+        $stmt_update = $pdo->prepare("update ordersPayments set paymentUuid = ?, amtPaid = ?, total = ?, refund = ?, tips = ?, lastMod = ?, originalTotal = ?, payment_type_code = ?, payment_type_name = ? where id = ?");
         $stmt_update->execute([
           $payment_uuid,
           (float)$amtPaid, 
@@ -1232,10 +1238,12 @@ for ($i = 0; $i < count($payments); $i++) {
           (float)$tips, 
           $lastMod, 
           $new_originalTotal,
+          $payment_type_code,
+          $payment_type_name,
           $existing_payment_id
         ]);
       } else {
-        $stmt_update = $pdo->prepare("update ordersPayments set amtPaid = ?, total = ?, refund = ?, tips = ?, lastMod = ?, originalTotal = ? where id = ?");
+        $stmt_update = $pdo->prepare("update ordersPayments set amtPaid = ?, total = ?, refund = ?, tips = ?, lastMod = ?, originalTotal = ?, payment_type_code = ?, payment_type_name = ? where id = ?");
         $stmt_update->execute([
           (float)$amtPaid, 
           (float)$total, 
@@ -1243,6 +1251,8 @@ for ($i = 0; $i < count($payments); $i++) {
           (float)$tips, 
           $lastMod, 
           $new_originalTotal,
+          $payment_type_code,
+          $payment_type_name,
           $existing_payment_id
         ]);
       }
@@ -1279,7 +1289,9 @@ for ($i = 0; $i < count($payments); $i++) {
     originalTotal = ?,
     editTerminalSerial = ?,
     editEmployeeId = ?,
-    editEmployeePIN = ?");
+    editEmployeePIN = ?,
+    payment_type_code = ?,
+    payment_type_name = ?");
     $stmt->execute([
       $payment_uuid ?? null,
       $order_uuid ?? null,
@@ -1302,7 +1314,9 @@ for ($i = 0; $i < count($payments); $i++) {
       $originalTotal,
       $editTerminalSerial,
       $editEmployeeId,
-      $editEmployeePIN
+      $editEmployeePIN,
+      $payment_type_code,
+      $payment_type_name
     ]);
     print_r("DEBUG: " . $stmt->rowCount() . " rows affected" . " \n");
     $orders_id = $pdo->lastInsertId();

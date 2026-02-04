@@ -1100,6 +1100,8 @@ foreach ($json_records as $record) {
         // Online orders use "paymentUuid", POS orders use "pUUID"
         $payment_uuid = $payment_data->paymentUuid ?? $payment_data->pUUID ?? null;
         $olapayApprovalId = $payment_data->olapayApprovalId ?? null;
+        $payment_type_code = isset($payment_data->other_paytype_code) ? $payment_data->other_paytype_code : null;
+        $payment_type_name = isset($payment_data->other_paytype_name) ? $payment_data->other_paytype_name : null;
         
         if ($isOnlinePlatform) {
             $order_uuid = $payment_data->orderUUID ?? null;
@@ -1181,11 +1183,11 @@ foreach ($json_records as $record) {
                 // Update payment including setting paymentUuid if it was null
                 if ($payment_uuid !== null) {
                     // Update by ID to ensure we update the correct payment
-                    $stmt_update_payment = $pdo->prepare("UPDATE ordersPayments SET paymentUuid = ?, amtPaid = ?, tips = ?, total = ?, refund = ?, lastMod = ?, originalTotal = ? WHERE id = ?");
-                    $stmt_update_payment->execute([$payment_uuid, (float)$amtPaid, (float)$tips, (float)$total, (float)$refund, $lastMod, $originalTotal, $existing_payment_id]);
+                    $stmt_update_payment = $pdo->prepare("UPDATE ordersPayments SET paymentUuid = ?, amtPaid = ?, tips = ?, total = ?, refund = ?, lastMod = ?, originalTotal = ?, payment_type_code = ?, payment_type_name = ? WHERE id = ?");
+                    $stmt_update_payment->execute([$payment_uuid, (float)$amtPaid, (float)$tips, (float)$total, (float)$refund, $lastMod, $originalTotal, $payment_type_code, $payment_type_name, $existing_payment_id]);
                 } else {
-                    $stmt_update_payment = $pdo->prepare("UPDATE ordersPayments SET amtPaid = ?, tips = ?, total = ?, refund = ?, lastMod = ?, originalTotal = ? WHERE id = ?");
-                    $stmt_update_payment->execute([(float)$amtPaid, (float)$tips, (float)$total, (float)$refund, $lastMod, $originalTotal, $existing_payment_id]);
+                    $stmt_update_payment = $pdo->prepare("UPDATE ordersPayments SET amtPaid = ?, tips = ?, total = ?, refund = ?, lastMod = ?, originalTotal = ?, payment_type_code = ?, payment_type_name = ? WHERE id = ?");
+                    $stmt_update_payment->execute([(float)$amtPaid, (float)$tips, (float)$total, (float)$refund, $lastMod, $originalTotal, $payment_type_code, $payment_type_name, $existing_payment_id]);
                 }
                 echo "✅ SUCCESS: Payment updated (ID: $existing_payment_id) in {$payment_update_time}ms\n";
             } else {
@@ -1231,7 +1233,9 @@ foreach ($json_records as $record) {
                 originalTotal = ?,
                 editTerminalSerial = ?,
                 editEmployeeId = ?,
-                editEmployeePIN = ?");
+                editEmployeePIN = ?,
+                payment_type_code = ?,
+                payment_type_name = ?");
             
             $stmt_insert_payment->execute([
                 $payment_uuid,
@@ -1255,7 +1259,9 @@ foreach ($json_records as $record) {
                 $originalTotal,
                 $editTerminalSerial,
                 $editEmployeeId,
-                $editEmployeePIN
+                $editEmployeePIN,
+                $payment_type_code,
+                $payment_type_name
             ]);
             
             $payment_insert_time = round((microtime(true) - $payment_insert_start) * 1000, 2);
