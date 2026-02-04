@@ -35,6 +35,18 @@ $msgfornoterminal = "No permission";
 $msgforsqlerror = "Unable to get data";
 $pdo = connect_db_and_set_http_method( "GET" );
 
+if ( $_REQUEST["type"] == "merchant" ) {
+  $stmt = $pdo->prepare("SELECT * FROM `terminals` WHERE vendors_id = ?");
+  $stmt->execute([ $_REQUEST["id"] ]);
+  if ( !$stmt->fetch() ) {
+    $res = array();
+    $res["count_items"] = array();
+    $res["amount_items"] = array();
+    $res["max_count"] = 0;
+    send_http_status_and_exit("200",json_encode($res));
+  }
+}
+
 $where = "";
 if ( $_REQUEST["type"] == "site" ) {}
 if ( $_REQUEST["type"] == "agent" ) { $where = 'and ordersPayments.agents_id = ?'; }
