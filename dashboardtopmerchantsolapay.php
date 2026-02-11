@@ -114,6 +114,13 @@ transaction_aggregates AS (
         -- Extract tax and tech fee to subtract if the transaction was TIPPED (synced after tip adjustment)
         MAX(CASE WHEN vt.trans_type IN ('Sale', 'Sale Cash') THEN COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.tax')) AS DECIMAL(10,2)), 0) ELSE 0 END) AS sale_tax,
         MAX(CASE WHEN vt.trans_type IN ('Sale', 'Sale Cash') THEN COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.tech_fee_amount')) AS DECIMAL(10,2)), 0) ELSE 0 END) AS sale_tech_fee,
+        -- Get max tip from Sale or TipAdjustment
+        MAX(CASE 
+            WHEN vt.trans_type IN ('Sale', 'Sale Cash', 'TipAdjustment') 
+                 OR JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.command')) = 'TipAdjustment'
+            THEN COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.tip')) AS DECIMAL(10,2)), 0) 
+            ELSE 0 
+        END) AS sale_tips,
         -- Check if any record in this chain is TIPPED or a TipAdjustment
         MAX(CASE WHEN vt.status = 'TIPPED' OR JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.command')) = 'TipAdjustment' THEN 1 ELSE 0 END) AS is_tipped,
         -- Check if the whole transaction was VOIDED
@@ -132,15 +139,24 @@ net_sales_per_transaction AS (
             WHEN is_voided = 1 THEN 0
             WHEN is_tipped = 1 THEN (base_subtotal - sale_tax - sale_tech_fee)
             ELSE base_subtotal
-        END) AS net_revenue
+        END) AS net_revenue,
+        (CASE WHEN is_voided = 1 THEN 0 ELSE sale_tips END) AS tips,
+        (CASE WHEN is_voided = 1 THEN 0 ELSE sale_tech_fee END) AS tech_fee,
+        (CASE WHEN is_voided = 1 THEN 0 ELSE sale_tax END) AS tax
     FROM transaction_aggregates
 )
 SELECT 
     accounts.id,
     COALESCE(accounts.companyname, '') AS business,
-    COUNT(trans_id) AS transactions,
-    COALESCE(SUM(refund_total), 0) AS refund,
-    COALESCE(SUM(net_revenue), 0) AS amount
+    COUNT(vt.trans_id) AS transactions,
+    COALESCE(SUM(vt.refund_total), 0) AS refund,
+    COALESCE(SUM(vt.net_revenue), 0) AS net_sale,
+    COALESCE(SUM(
+        CASE 
+            WHEN (vt.net_revenue - vt.refund_total) <= 0.0001 THEN 0 
+            ELSE (vt.net_revenue + vt.tips + vt.tech_fee + vt.tax - vt.refund_total) 
+        END
+    ), 0) AS amount
 FROM net_sales_per_transaction vt
 JOIN terminals ON terminals.serial = vt.serial
 JOIN accounts ON terminals.vendors_id = accounts.id
@@ -156,7 +172,7 @@ $params = [
     ':endtime' => $endtime
 ];
 
-error_log("Final query (v2-fixed): " . str_replace(
+error_log("Final query (v3-net-sale): " . str_replace(
     [':starttime', ':endtime'],
     [$starttime, $endtime],
     str_replace(
@@ -179,6 +195,7 @@ while ($row = $stmt->fetch()) {
         "business" => $row["business"] ?? "",
         "transactions" => $row["transactions"],
         "refund" => $row["refund"],
+        "net_sale" => (float)$row["net_sale"],
         "amount" => (float)$row["amount"]
     ];
 
