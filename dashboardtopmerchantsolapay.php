@@ -77,8 +77,8 @@ $olapay_merchants_query = "
 $stmt_merchants = $pdo->query($olapay_merchants_query);
 $olapay_merchant_ids = $stmt_merchants->fetchAll(PDO::FETCH_COLUMN);
 
-// Main query using CTE to filter out pollution (CREATED status, empty trans_id, etc.)
-// Uses generated columns (status, trans_type, amount) for performance - no JSON extraction needed
+// Main query using CTE to filter out pollution and aggregate per transaction
+// Optimized to calculate "Doanh thu thuần" (Net Sales) by excluding tips, taxes, tech fees and subtracting refunds
 $query = "
 WITH valid_transactions AS (
     SELECT 
@@ -87,38 +87,77 @@ WITH valid_transactions AS (
         uot.trans_type,
         uot.amount,
         uot.status,
-        uot.lastmod
+        uot.content
     FROM unique_olapay_transactions uot
-    WHERE uot.lastmod > :starttime 
-      AND uot.lastmod < :endtime
+    WHERE uot.lastmod >= :starttime 
+      AND uot.lastmod <= :endtime
       -- Filter out pollution: CREATED status = incomplete/pending transactions
-      AND uot.status NOT IN ('CREATED', '', 'FAIL', 'REFUNDED')
+      -- Include 'REFUNDED' to ensure we capture the original sale base even if fully refunded
+      AND uot.status NOT IN ('CREATED', '', 'FAIL', 'CANCELLED')
       -- Filter out records without valid trans_id
       AND uot.trans_id IS NOT NULL 
       AND uot.trans_id != ''
       -- Filter out invalid transaction types
       AND uot.trans_type IS NOT NULL
       AND uot.trans_type NOT IN ('Return Cash', '', 'Auth')
+),
+transaction_aggregates AS (
+    SELECT 
+        vt.serial,
+        vt.trans_id,
+        -- Get base subtotal from the original SALE/SALE CASH record. Fallback to amount if subtotal is missing/zero.
+        MAX(CASE
+            WHEN vt.trans_type IN ('Sale', 'Sale Cash', 'Debit')
+            THEN COALESCE(NULLIF(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.subtotal')) AS DECIMAL(10,2)), 0), vt.amount, 0)
+            ELSE 0
+        END) AS base_subtotal,
+        -- Extract tax and tech fee to subtract if the transaction was TIPPED (synced after tip adjustment)
+        MAX(CASE WHEN vt.trans_type IN ('Sale', 'Sale Cash', 'Debit') THEN COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.tax')) AS DECIMAL(10,2)), 0) ELSE 0 END) AS sale_tax,
+        MAX(CASE WHEN vt.trans_type IN ('Sale', 'Sale Cash', 'Debit') THEN COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.tech_fee_amount')) AS DECIMAL(10,2)), 0) ELSE 0 END) AS sale_tech_fee,
+        -- Get max tip from Sale or TipAdjustment
+        MAX(CASE 
+            WHEN vt.trans_type IN ('Sale', 'Sale Cash', 'TipAdjustment') 
+                 OR JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.command')) = 'TipAdjustment'
+            THEN COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.tip')) AS DECIMAL(10,2)), 0) 
+            ELSE 0 
+        END) AS sale_tips,
+        -- Check if any record in this chain is TIPPED or a TipAdjustment
+        MAX(CASE WHEN vt.status = 'TIPPED' OR JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.command')) = 'TipAdjustment' THEN 1 ELSE 0 END) AS is_tipped,
+        -- Check if the whole transaction was VOIDED
+        MAX(CASE WHEN vt.trans_type IN ('Void', 'Voided') OR vt.status = 'VOIDED' THEN 1 ELSE 0 END) AS is_voided,
+        -- Total refund amount for this transaction
+        SUM(CASE WHEN vt.trans_type IN ('Refund', 'Return', 'Refunded', 'Returned', 'Debit Return') THEN COALESCE(vt.amount, 0) ELSE 0 END) AS refund_total
+    FROM valid_transactions vt
+    GROUP BY vt.serial, vt.trans_id
+),
+net_sales_per_transaction AS (
+    SELECT 
+        serial,
+        trans_id,
+        refund_total,
+        (CASE 
+            WHEN is_voided = 1 THEN 0
+            WHEN is_tipped = 1 THEN (base_subtotal - sale_tax - sale_tech_fee)
+            ELSE base_subtotal
+        END) AS net_revenue,
+        (CASE WHEN is_voided = 1 THEN 0 ELSE sale_tips END) AS tips,
+        (CASE WHEN is_voided = 1 THEN 0 ELSE sale_tech_fee END) AS tech_fee,
+        (CASE WHEN is_voided = 1 THEN 0 ELSE sale_tax END) AS tax
+    FROM transaction_aggregates
 )
 SELECT 
     accounts.id,
-    accounts.companyname AS business,
-    COUNT(DISTINCT vt.trans_id) AS transactions,
-    SUM(
+    COALESCE(accounts.companyname, '') AS business,
+    COUNT(vt.trans_id) AS transactions,
+    COALESCE(SUM(vt.refund_total), 0) AS refund,
+    COALESCE(SUM(vt.net_revenue), 0) AS net_sale,
+    COALESCE(SUM(
         CASE 
-            WHEN vt.trans_type IN ('Refund', 'Return')
-            THEN vt.amount
-            ELSE 0 
+            WHEN (vt.net_revenue - vt.refund_total) <= 0.0001 THEN 0 
+            ELSE (vt.net_revenue + vt.tips + vt.tech_fee + vt.tax - vt.refund_total) 
         END
-    ) AS refund,
-    SUM(vt.amount) - SUM(
-        CASE 
-            WHEN vt.trans_type IN ('Refund', 'Return')
-            THEN vt.amount
-            ELSE 0 
-        END
-    ) AS amount
-FROM valid_transactions vt
+    ), 0) AS amount
+FROM net_sales_per_transaction vt
 JOIN terminals ON terminals.serial = vt.serial
 JOIN accounts ON terminals.vendors_id = accounts.id
 WHERE accounts.id IN (" . implode(',', $olapay_merchant_ids ?: [0]) . ")
@@ -133,7 +172,7 @@ $params = [
     ':endtime' => $endtime
 ];
 
-error_log("Final query (v2): " . str_replace(
+error_log("Final query (v3-net-sale): " . str_replace(
     [':starttime', ':endtime'],
     [$starttime, $endtime],
     str_replace(
@@ -153,14 +192,15 @@ $stmt->execute($params);
 while ($row = $stmt->fetch()) {
     $entry = [
         "id" => $row["id"],
-        "business" => $row["business"],
+        "business" => $row["business"] ?? "",
         "transactions" => $row["transactions"],
         "refund" => $row["refund"],
+        "net_sale" => (float)$row["net_sale"],
         "amount" => (float)$row["amount"]
     ];
 
-    if (isset($row["qty"]) && $row["qty"] > $res["max_count"]) {
-        $res["max_count"] = $row["qty"];
+    if (isset($row["transactions"]) && (int)$row["transactions"] > $res["max_count"]) {
+        $res["max_count"] = (int)$row["transactions"];
     }
 
     $res["count_items"][] = $entry;
