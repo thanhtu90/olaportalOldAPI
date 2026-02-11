@@ -108,18 +108,18 @@ transaction_aggregates AS (
         -- Get base subtotal from the original SALE/SALE CASH record. Fallback to amount if subtotal is missing/zero.
         MAX(CASE 
             WHEN vt.trans_type IN ('Sale', 'Sale Cash') 
-            THEN COALESCE(NULLIF(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.subtotal')) AS DECIMAL(10,2)), 0), vt.amount)
+            THEN COALESCE(NULLIF(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.subtotal')) AS DECIMAL(10,2)), 0), vt.amount, 0)
             ELSE 0 
         END) AS base_subtotal,
         -- Extract tax and tech fee to subtract if the transaction was TIPPED (synced after tip adjustment)
-        MAX(CASE WHEN vt.trans_type IN ('Sale', 'Sale Cash') THEN CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.tax')) AS DECIMAL(10,2)) ELSE 0 END) AS sale_tax,
-        MAX(CASE WHEN vt.trans_type IN ('Sale', 'Sale Cash') THEN CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.tech_fee_amount')) AS DECIMAL(10,2)) ELSE 0 END) AS sale_tech_fee,
+        MAX(CASE WHEN vt.trans_type IN ('Sale', 'Sale Cash') THEN COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.tax')) AS DECIMAL(10,2)), 0) ELSE 0 END) AS sale_tax,
+        MAX(CASE WHEN vt.trans_type IN ('Sale', 'Sale Cash') THEN COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.tech_fee_amount')) AS DECIMAL(10,2)), 0) ELSE 0 END) AS sale_tech_fee,
         -- Check if any record in this chain is TIPPED or a TipAdjustment
         MAX(CASE WHEN vt.status = 'TIPPED' OR JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.command')) = 'TipAdjustment' THEN 1 ELSE 0 END) AS is_tipped,
         -- Check if the whole transaction was VOIDED
         MAX(CASE WHEN vt.trans_type IN ('Void', 'Voided') THEN 1 ELSE 0 END) AS is_voided,
         -- Total refund amount for this transaction
-        SUM(CASE WHEN vt.trans_type IN ('Refund', 'Return', 'Refunded', 'Returned') THEN vt.amount ELSE 0 END) AS refund_total
+        SUM(CASE WHEN vt.trans_type IN ('Refund', 'Return', 'Refunded', 'Returned') THEN COALESCE(vt.amount, 0) ELSE 0 END) AS refund_total
     FROM valid_transactions vt
     GROUP BY vt.serial, vt.trans_id
 ),
@@ -137,10 +137,10 @@ net_sales_per_transaction AS (
 )
 SELECT 
     accounts.id,
-    accounts.companyname AS business,
+    COALESCE(accounts.companyname, '') AS business,
     COUNT(trans_id) AS transactions,
-    SUM(refund_total) AS refund,
-    SUM(net_revenue) AS amount
+    COALESCE(SUM(refund_total), 0) AS refund,
+    COALESCE(SUM(net_revenue), 0) AS amount
 FROM net_sales_per_transaction vt
 JOIN terminals ON terminals.serial = vt.serial
 JOIN accounts ON terminals.vendors_id = accounts.id
@@ -176,14 +176,14 @@ $stmt->execute($params);
 while ($row = $stmt->fetch()) {
     $entry = [
         "id" => $row["id"],
-        "business" => $row["business"],
+        "business" => $row["business"] ?? "",
         "transactions" => $row["transactions"],
         "refund" => $row["refund"],
         "amount" => (float)$row["amount"]
     ];
 
-    if (isset($row["qty"]) && $row["qty"] > $res["max_count"]) {
-        $res["max_count"] = $row["qty"];
+    if (isset($row["transactions"]) && (int)$row["transactions"] > $res["max_count"]) {
+        $res["max_count"] = (int)$row["transactions"];
     }
 
     $res["count_items"][] = $entry;
