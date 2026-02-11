@@ -93,7 +93,7 @@ WITH valid_transactions AS (
       AND uot.lastmod <= :endtime
       -- Filter out pollution: CREATED status = incomplete/pending transactions
       -- Include 'REFUNDED' to ensure we capture the original sale base even if fully refunded
-      AND uot.status NOT IN ('CREATED', '', 'FAIL')
+      AND uot.status NOT IN ('CREATED', '', 'FAIL', 'CANCELLED')
       -- Filter out records without valid trans_id
       AND uot.trans_id IS NOT NULL 
       AND uot.trans_id != ''
@@ -106,14 +106,14 @@ transaction_aggregates AS (
         vt.serial,
         vt.trans_id,
         -- Get base subtotal from the original SALE/SALE CASH record. Fallback to amount if subtotal is missing/zero.
-        MAX(CASE 
-            WHEN vt.trans_type IN ('Sale', 'Sale Cash') 
+        MAX(CASE
+            WHEN vt.trans_type IN ('Sale', 'Sale Cash', 'Debit')
             THEN COALESCE(NULLIF(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.subtotal')) AS DECIMAL(10,2)), 0), vt.amount, 0)
-            ELSE 0 
+            ELSE 0
         END) AS base_subtotal,
         -- Extract tax and tech fee to subtract if the transaction was TIPPED (synced after tip adjustment)
-        MAX(CASE WHEN vt.trans_type IN ('Sale', 'Sale Cash') THEN COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.tax')) AS DECIMAL(10,2)), 0) ELSE 0 END) AS sale_tax,
-        MAX(CASE WHEN vt.trans_type IN ('Sale', 'Sale Cash') THEN COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.tech_fee_amount')) AS DECIMAL(10,2)), 0) ELSE 0 END) AS sale_tech_fee,
+        MAX(CASE WHEN vt.trans_type IN ('Sale', 'Sale Cash', 'Debit') THEN COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.tax')) AS DECIMAL(10,2)), 0) ELSE 0 END) AS sale_tax,
+        MAX(CASE WHEN vt.trans_type IN ('Sale', 'Sale Cash', 'Debit') THEN COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.tech_fee_amount')) AS DECIMAL(10,2)), 0) ELSE 0 END) AS sale_tech_fee,
         -- Get max tip from Sale or TipAdjustment
         MAX(CASE 
             WHEN vt.trans_type IN ('Sale', 'Sale Cash', 'TipAdjustment') 
@@ -124,9 +124,9 @@ transaction_aggregates AS (
         -- Check if any record in this chain is TIPPED or a TipAdjustment
         MAX(CASE WHEN vt.status = 'TIPPED' OR JSON_UNQUOTE(JSON_EXTRACT(vt.content, '$.command')) = 'TipAdjustment' THEN 1 ELSE 0 END) AS is_tipped,
         -- Check if the whole transaction was VOIDED
-        MAX(CASE WHEN vt.trans_type IN ('Void', 'Voided') THEN 1 ELSE 0 END) AS is_voided,
+        MAX(CASE WHEN vt.trans_type IN ('Void', 'Voided') OR vt.status = 'VOIDED' THEN 1 ELSE 0 END) AS is_voided,
         -- Total refund amount for this transaction
-        SUM(CASE WHEN vt.trans_type IN ('Refund', 'Return', 'Refunded', 'Returned') THEN COALESCE(vt.amount, 0) ELSE 0 END) AS refund_total
+        SUM(CASE WHEN vt.trans_type IN ('Refund', 'Return', 'Refunded', 'Returned', 'Debit Return') THEN COALESCE(vt.amount, 0) ELSE 0 END) AS refund_total
     FROM valid_transactions vt
     GROUP BY vt.serial, vt.trans_id
 ),
