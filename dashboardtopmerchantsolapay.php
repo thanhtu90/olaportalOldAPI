@@ -40,7 +40,7 @@ $pdo = connect_db_and_set_http_method("GET");
 $where = "";
 switch ($_REQUEST["type"]) {
     case "agent":
-        $where = 'AND terminals.agents_id = :id';
+        $where = 'AND accounts.accounts_id = :id';
         break;
     case "merchant":
         $where = 'AND accounts.id = :id';
@@ -65,6 +65,7 @@ $olapay_merchants_query = "
     JOIN terminal_payment_methods ON terminal_payment_methods.terminal_id = terminals.id
     JOIN payment_methods ON payment_methods.id = terminal_payment_methods.payment_method_id
     WHERE payment_methods.code = 'olapay'
+    " . ($_REQUEST["type"] === 'agent' ? "AND accounts.accounts_id = :agent_id" : "") . "
     AND accounts.id NOT IN (
         SELECT DISTINCT accounts.id
         FROM accounts
@@ -72,9 +73,15 @@ $olapay_merchants_query = "
         JOIN terminal_payment_methods ON terminal_payment_methods.terminal_id = terminals.id
         JOIN payment_methods ON payment_methods.id = terminal_payment_methods.payment_method_id
         WHERE payment_methods.code = 'olapos'
+        " . ($_REQUEST["type"] === 'agent' ? "AND accounts.accounts_id = :agent_id" : "") . "
     )";  // Exclude merchants that have olapos payment method
 
-$stmt_merchants = $pdo->query($olapay_merchants_query);
+$stmt_merchants = $pdo->prepare($olapay_merchants_query);
+$params_merchants = [];
+if ($_REQUEST["type"] === 'agent') {
+    $params_merchants[':agent_id'] = $_REQUEST["id"];
+}
+$stmt_merchants->execute($params_merchants);
 $olapay_merchant_ids = $stmt_merchants->fetchAll(PDO::FETCH_COLUMN);
 
 // Main query using CTE to filter out pollution and aggregate per transaction
