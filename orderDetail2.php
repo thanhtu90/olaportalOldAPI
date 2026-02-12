@@ -76,6 +76,8 @@ while ( $row2 = $stmt2->fetch() ) {
     // Add paymentUuid and paymentLastMod for deduplication logic
     $item["paymentUuid"] = isset($row2["paymentUuid"]) ? $row2["paymentUuid"] : null;
     $item["paymentLastMod"] = isset($row2["lastMod"]) ? $row2["lastMod"] : null;
+    $item["payment_type_code"] = isset($row2["payment_type_code"]) ? $row2["payment_type_code"] : null;
+    $item["payment_type_name"] = isset($row2["payment_type_name"]) ? $row2["payment_type_name"] : null;
     
     // Deduplicate by paymentUuid - keep the one with greatest paymentLastMod
     if (!empty($item["paymentUuid"])) {

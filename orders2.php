@@ -193,7 +193,9 @@ try {
                     olapayApprovalId,
                     lastMod as paymentLastMod,
                     paymentUuid,
-                    amtPaid
+                    amtPaid,
+                    payment_type_code,
+                    payment_type_name
                 FROM ordersPayments
                 WHERE orderReference IN ($placeholders)
                 ORDER BY orderReference, paymentUuid, paymentLastMod DESC
@@ -237,7 +239,9 @@ try {
                         olapayApprovalId,
                         lastMod as paymentLastMod,
                         paymentUuid,
-                        amtPaid
+                        amtPaid,
+                        payment_type_code,
+                        payment_type_name
                     FROM ordersPayments
                     WHERE orderUuid IN ($placeholders)
                     ORDER BY orderUuid, paymentUuid, paymentLastMod DESC
@@ -332,7 +336,9 @@ try {
                 "olapayApprovalId" => $row["olapayApprovalId"],
                 "paymentLastMod" => $row["paymentLastMod"],
                 "paymentUuid" => $row["paymentUuid"],
-                "amtPaid" => $row["amtPaid"]
+                "amtPaid" => $row["amtPaid"],
+                "payment_type_code" => $row["payment_type_code"] ?? null,
+                "payment_type_name" => $row["payment_type_name"] ?? null
             ];
             
             // Deduplicate by paymentUuid - keep the one with greatest paymentLastMod
