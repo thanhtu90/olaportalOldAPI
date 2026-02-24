@@ -398,17 +398,18 @@ function processOrderItemsForOrder($pdo, $items_json, $orderReference, $order, $
         print_r("DEBUG: Item $j - orderRef: $itemOrderRef vs current orderRef: $orderReference" . " \n");
         
         if ($orderReference == $itemOrderRef) {
-            // Deduplicate by itemUuid + price to prevent duplicate inserts
-            // BUT allow same item with different price (dual pricing: cash vs card)
-            // Round price to 2 decimal places for consistent comparison
+            // Deduplicate by itemUuid + price + itemDiscount to prevent duplicate inserts.
+            // Allow same item with different price (dual pricing: cash vs card) or different
+            // itemDiscount (e.g. one line with group discount, another without).
             $itemUuid = $isOnlinePlatform 
                 ? ($items_json[$j]->{"orderItem"}->{"uuid"} ?? null) 
                 : ($items_json[$j]->{"orderItem"}->{"iUUID"} ?? null);
             $itemPrice = round((float)($items_json[$j]->{"orderItem"}->{"price"} ?? 0), 2);
-            $dedupeKey = $itemUuid . '_' . $itemPrice;
+            $itemDiscount = round((float)($items_json[$j]->{"orderItem"}->{"itemDiscount"} ?? 0), 2);
+            $dedupeKey = $itemUuid . '_' . $itemPrice . '_' . $itemDiscount;
             
             if ($itemUuid !== null && isset($processed_item_uuids[$dedupeKey])) {
-                print_r("DEBUG: Skipping duplicate itemUuid+price: $dedupeKey for orderReference: $orderReference" . " \n");
+                print_r("DEBUG: Skipping duplicate itemUuid+price+itemDiscount: $dedupeKey for orderReference: $orderReference" . " \n");
                 continue;
             }
             
@@ -500,7 +501,7 @@ function processOrderItemsForOrder($pdo, $items_json, $orderReference, $order, $
  * @param int $terminals_id Terminal ID
  * @param int $vendors_id Vendor ID
  * @param array $orderRefMap Order reference mapping (passed by reference)
- * @param array $orderData Order data for update (for online platform)
+ * @param array $orderData Order data for update (online/POS existing order)
  * @return bool True if order exists and should be skipped, false otherwise
  */
 function checkAndHandleExistingOrder($pdo, $stmt, $isOnlinePlatform, $orderReference, $onlineorder_id, $terminals_id, $vendors_id, &$orderRefMap, $orderData = null) {
@@ -516,12 +517,56 @@ function checkAndHandleExistingOrder($pdo, $stmt, $isOnlinePlatform, $orderRefer
         fclose($fp);
         
         // Add existing order to map for payment processing
-        $existing_order_stmt = $pdo->prepare("SELECT id FROM orders WHERE vendors_id = ? AND terminals_id = ? AND orderReference = ? ORDER BY id DESC LIMIT 1");
+        $existing_order_stmt = $pdo->prepare("SELECT id, lastMod FROM orders WHERE vendors_id = ? AND terminals_id = ? AND orderReference = ? ORDER BY id DESC LIMIT 1");
         $existing_order_stmt->execute([$vendors_id, $terminals_id, $orderReference]);
+        $existing_order = null;
         if ($existing_order_stmt->rowCount() > 0) {
             $existing_order = $existing_order_stmt->fetch();
             $orderRefMap[strval($orderReference)] = $existing_order["id"];
             print_r("Added existing order to map: " . $orderReference . " -> " . $existing_order["id"] . " \n");
+        }
+        // Update existing POS order header values from latest JSON payload.
+        // This prevents orders.subTotal/tax from getting stale when items are resynced.
+        if ($isOnlinePlatform == false && $orderData !== null && $existing_order !== null) {
+            $existing_lastmod = isset($existing_order["lastMod"]) ? (int)$existing_order["lastMod"] : 0;
+            $incoming_lastmod = isset($orderData['lastMod']) ? (int)$orderData['lastMod'] : 0;
+            if ($incoming_lastmod >= $existing_lastmod) {
+                $stmt_update_existing_pos_order = $pdo->prepare("UPDATE orders SET
+                    employee_id = ?,
+                    lastMod = ?,
+                    notes = ?,
+                    uuid = ?,
+                    orderDate = ?,
+                    orderName = ?,
+                    subTotal = ?,
+                    tax = ?,
+                    delivery_fee = ?,
+                    delivery_type = ?,
+                    total = ?,
+                    store_uuid = ?,
+                    secondary_tax_list = ?
+                    WHERE id = ? AND terminals_id = ?");
+                $stmt_update_existing_pos_order->execute([
+                    $orderData['employee_id'],
+                    $orderData['lastMod'],
+                    $orderData['notes'],
+                    $orderData['uuid'],
+                    $orderData['orderDate'],
+                    $orderData['orderName'],
+                    $orderData['subTotal'],
+                    $orderData['tax'],
+                    $orderData['delivery_fee'],
+                    $orderData['delivery_type'],
+                    $orderData['total'],
+                    $orderData['store_uuid'],
+                    $orderData['secondary_tax_list'],
+                    $existing_order["id"],
+                    $terminals_id
+                ]);
+                print_r("Updated existing POS order header for orderReference " . $orderReference . " - Rows affected: " . $stmt_update_existing_pos_order->rowCount() . " \n");
+            } else {
+                print_r("Skipped POS order header update for orderReference " . $orderReference . " due to older lastMod payload" . " \n");
+            }
         }
         
         // Update online platform order if needed
@@ -969,25 +1014,24 @@ for ($i = 0; $i < count($orders_json); $i++) {
     $secondary_tax_list = json_encode($orders_json[$i]->{"secondaryTaxList"});
   }
   $orderData = null;
-  if ($isOnlinePlatform == true) {
-    $orderData = [
-      'employee_id' => $employee_id,
-      'lastMod' => $lastMod,
-      'notes' => $notes,
-      'uuid' => $online_platform_order_uuid,
-      'orderReference' => $orderReference,
-      'onlineorder_id' => $onlineorder_id,
-      'onlinetrans_id' => $onlinetrans_id,
-      'orderDate' => $orderDate,
-      'orderName' => $orderName,
-      'subTotal' => $subTotal,
-      'tax' => $tax,
-      'delivery_fee' => $delivery_fee,
-      'delivery_type' => getDeliveryServiceCode($delivery_type),
-      'total' => $total,
-      'store_uuid' => $store_uuid
-    ];
-  }
+  $orderData = [
+    'employee_id' => $employee_id,
+    'lastMod' => $lastMod,
+    'notes' => $notes,
+    'uuid' => $isOnlinePlatform ? $online_platform_order_uuid : ($order_uuid ?? null),
+    'orderReference' => $orderReference,
+    'onlineorder_id' => $onlineorder_id,
+    'onlinetrans_id' => $onlinetrans_id,
+    'orderDate' => $orderDate,
+    'orderName' => $orderName,
+    'subTotal' => $subTotal,
+    'tax' => $tax,
+    'delivery_fee' => $delivery_fee,
+    'delivery_type' => getDeliveryServiceCode($delivery_type),
+    'total' => $total,
+    'store_uuid' => $store_uuid,
+    'secondary_tax_list' => $secondary_tax_list
+  ];
   
   // Check if order exists and handle accordingly
   if (checkAndHandleExistingOrder($pdo, $stmt, $isOnlinePlatform, $orderReference, $onlineorder_id, $terminals_id, $vendors_id, $orderRefMap, $orderData)) {
