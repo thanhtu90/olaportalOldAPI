@@ -95,6 +95,44 @@ while ( $row2 = $stmt2->fetch() ) {
 foreach ($paymentsByUuid as $payment) {
     array_push( $entry["ordersPayments"], $payment);
 }
+
+// Recalculate subTotal from actual orderItems when items exist
+// (orders.subTotal in DB can be stale when items are added/synced after order creation)
+if (count($entry["orderDetail"]) > 0) {
+    $calculatedSubTotal = 0;
+    foreach ($entry["orderDetail"] as $item) {
+        $itemTotal = abs((float)$item["amount"]) * (int)$item["quantity"];
+        foreach ($item["modifiers"] as $mod) {
+            $itemTotal += (float)$mod["amount"];
+        }
+        if (!empty($item["itemDiscount"]) && (float)$item["itemDiscount"] > 0.00001) {
+            $itemTotal -= abs((float)$item["itemDiscount"]) * (int)$item["quantity"];
+        }
+        if (!empty($item["crv"]) && (float)$item["crv"] > 0.00001) {
+            $itemTotal += abs((float)$item["crv"]) * (int)$item["quantity"];
+        }
+        $calculatedSubTotal += $itemTotal;
+    }
+    $entry["subTotal"] = round($calculatedSubTotal, 2);
+
+    // Derive tax from payments: tax = totalPaid - subTotal - tips - techFee + discount
+    // This ensures tax is consistent with corrected subTotal
+    if (count($entry["ordersPayments"]) > 0) {
+        $totalPaid = 0;
+        $totalTips = 0;
+        $totalTechFee = 0;
+        foreach ($entry["ordersPayments"] as $p) {
+            $totalPaid += (float)$p["total"];
+            $totalTips += (float)$p["tip"];
+            $totalTechFee += (float)$p["techFee"];
+        }
+        $derivedTax = round($totalPaid - $entry["subTotal"] - $totalTips - $totalTechFee + (float)$entry["discount"], 2);
+        if ($derivedTax >= 0) {
+            $entry["tax"] = $derivedTax;
+        }
+    }
+}
+
 array_push( $res, $entry );
 
 send_http_status_and_exit("200",json_encode($res));

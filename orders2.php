@@ -301,10 +301,41 @@ try {
         return $techFeeRates;
     });
     
-    // Execute all three queries in parallel
+    // Calculate subTotal from actual orderItems (orders.subTotal can be stale)
+    $itemSubtotalsTask = async(function () use ($orderUuids, $batchSize) {
+        include_once __DIR__ . "/library/utils.php";
+        $pdo = connect_db_and_set_http_method("GET");
+        $subtotals = [];
+        if (empty($orderUuids)) return $subtotals;
+        $batches = array_chunk($orderUuids, $batchSize);
+        foreach ($batches as $batch) {
+            $placeholders = implode(',', array_fill(0, count($batch), '?'));
+            $query = "
+                SELECT orderUuid,
+                    SUM(CASE
+                        WHEN items_id = 0 THEN price * qty
+                            - COALESCE(NULLIF(itemDiscount, 0), 0) * qty
+                            + COALESCE(NULLIF(crv, 0), 0) * qty
+                        ELSE price
+                    END) as calculated_subtotal
+                FROM orderItems
+                WHERE orderUuid IN ($placeholders)
+                GROUP BY orderUuid
+            ";
+            $stmt = $pdo->prepare($query);
+            $stmt->execute($batch);
+            while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+                $subtotals[$row["orderUuid"]] = round((float)$row["calculated_subtotal"], 2);
+            }
+        }
+        return $subtotals;
+    });
+
+    // Execute all four queries in parallel
     $pool[] = $discountsTask;
     $pool[] = $paymentsTask;
     $pool[] = $techFeeRateTask;
+    $pool[] = $itemSubtotalsTask;
     
     $startTime = microtime(true);
     $results = $pool->wait();
@@ -314,6 +345,7 @@ try {
     $discounts = $results[0];
     $paymentsByOrderRaw = $results[1];
     $techFeeRates = $results[2];
+    $itemSubtotals = $results[3];
     
     // Process payments: deduplicate by paymentUuid and convert to final format
     $paymentsByOrder = [];
@@ -376,7 +408,8 @@ try {
         $entry["tax"] = $order["tax"];
         $entry["discount"] = isset($discounts[$order["id"]]) ? $discounts[$order["id"]] : 0;
         $entry["id"] = $order["id"];
-        $entry["subtotal"] = $order["subTotal"];
+        // Use calculated subTotal from items when available (fixes stale orders.subTotal)
+        $entry["subtotal"] = isset($itemSubtotals[$order["uuid"]]) ? $itemSubtotals[$order["uuid"]] : $order["subTotal"];
         $entry["cnt"] = isset($paymentCounts[$order["id"]]) ? $paymentCounts[$order["id"]] : 0;
         $entry["terminals_id"] = $order["terminals_id"];
         $entry["delivery_type"] = $order["delivery_type"];
@@ -389,13 +422,30 @@ try {
         
         // Get payments for this order
         $entry["payments"] = isset($paymentsByOrder[$order["id"]]) ? $paymentsByOrder[$order["id"]] : [];
-        
+
         // Get techFeeRate for this order (first tech_fee_rate > 0 from orderItems)
         $entry["techFeeRate"] = isset($techFeeRates[$order["uuid"]]) ? $techFeeRates[$order["uuid"]] : null;
-        
+
+        // Derive tax when subTotal was recalculated from items
+        // Formula: tax = totalPaid - subTotal - tips - techFee + discount
+        if (isset($itemSubtotals[$order["uuid"]]) && count($entry["payments"]) > 0) {
+            $totalPaid = 0;
+            $totalTips = 0;
+            $totalTechFee = 0;
+            foreach ($entry["payments"] as $p) {
+                $totalPaid += (float)$p["total"];
+                $totalTips += (float)$p["tips"];
+                $totalTechFee += (float)$p["techFee"];
+            }
+            $derivedTax = round($totalPaid - (float)$entry["subtotal"] - $totalTips - $totalTechFee + (float)$entry["discount"], 2);
+            if ($derivedTax >= 0) {
+                $entry["tax"] = $derivedTax;
+            }
+        }
+
         // Secondary tax list
         $entry["secondaryTaxList"] = $order["secondary_tax_list"];
-        
+
         array_push($allResults, $entry);
     }
     
