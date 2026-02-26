@@ -59,6 +59,14 @@ $stmt = $pdo->prepare("
     ORDER BY t.id DESC
 ");
 $stmt->execute([$_REQUEST["vendorsId"]]);
+
+// Bulk auto-unblock stale terminals (blocked > 10 min) in one UPDATE before reading.
+// Uses WHERE blocked = true AND blocked_at condition to avoid overwriting a concurrent re-block.
+$pdo->prepare(
+    "UPDATE terminals SET blocked = false, blocked_at = NULL, blocked_reason = NULL
+     WHERE vendors_id = ? AND blocked = true AND blocked_at < DATE_SUB(NOW(), INTERVAL 10 MINUTE)"
+)->execute([$_REQUEST["vendorsId"]]);
+
 $res["data"] = array();
 while ($row = $stmt->fetch()) {
     $entry = array();
@@ -68,22 +76,19 @@ while ($row = $stmt->fetch()) {
     $entry["enterdate"] = $row["enterdate"];
     $entry["store_uuid"] = $row["store_uuid"];
     $entry["payment_methods"] = json_decode($row["payment_methods"], true);
-    // Blocked fields for async tombstone processing
-    $entry["blocked"] = (bool)($row["blocked"] ?? false);
-    $entry["blocked_at"] = $row["blocked_at"] ?? null;
-    $entry["blocked_reason"] = $row["blocked_reason"] ?? null;
-
-    // Auto-unblock safety: if blocked for > 10 minutes
-    if ($entry["blocked"] && $entry["blocked_at"]) {
-        $blockedTime = strtotime($entry["blocked_at"]);
-        if ($blockedTime && (time() - $blockedTime) > 600) {
-            $unblockStmt = $pdo->prepare("UPDATE terminals SET blocked = false, blocked_at = NULL, blocked_reason = NULL WHERE id = ?");
-            $unblockStmt->execute([$entry["id"]]);
-            $entry["blocked"] = false;
-            $entry["blocked_at"] = null;
-            $entry["blocked_reason"] = null;
-        }
+    // Blocked fields for async tombstone processing.
+    // Re-read from row (reflects pre-bulk-unblock state); stale rows show unblocked
+    // because the bulk UPDATE already ran. Next fetch will have fresh data.
+    $isBlocked = (bool)($row["blocked"] ?? false);
+    $blockedAt = $row["blocked_at"] ?? null;
+    // If this row was stale-blocked (> 10 min), the bulk UPDATE already cleared it
+    if ($isBlocked && $blockedAt && (time() - strtotime($blockedAt)) > 600) {
+        $isBlocked = false;
+        $blockedAt = null;
     }
+    $entry["blocked"] = $isBlocked;
+    $entry["blocked_at"] = $isBlocked ? $blockedAt : null;
+    $entry["blocked_reason"] = $isBlocked ? ($row["blocked_reason"] ?? null) : null;
 
     array_push($res["data"], $entry);
 }
