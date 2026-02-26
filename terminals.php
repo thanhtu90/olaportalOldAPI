@@ -68,6 +68,22 @@ while ($row = $stmt->fetch()) {
     $entry["enterdate"] = $row["enterdate"];
     $entry["store_uuid"] = $row["store_uuid"];
     $entry["payment_methods"] = json_decode($row["payment_methods"], true);
+    // Blocked fields for async tombstone processing
+    $entry["blocked"] = (bool)($row["blocked"] ?? false);
+    $entry["blocked_at"] = $row["blocked_at"] ?? null;
+    $entry["blocked_reason"] = $row["blocked_reason"] ?? null;
+
+    // Auto-unblock safety: if blocked for > 10 minutes
+    if ($entry["blocked"] && $entry["blocked_at"]) {
+        $blockedTime = strtotime($entry["blocked_at"]);
+        if ($blockedTime && (time() - $blockedTime) > 600) {
+            $unblockStmt = $pdo->prepare("UPDATE terminals SET blocked = false, blocked_at = NULL, blocked_reason = NULL WHERE id = ?");
+            $unblockStmt->execute([$entry["id"]]);
+            $entry["blocked"] = false;
+            $entry["blocked_at"] = null;
+            $entry["blocked_reason"] = null;
+        }
+    }
 
     array_push($res["data"], $entry);
 }
