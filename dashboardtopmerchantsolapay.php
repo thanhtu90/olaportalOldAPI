@@ -57,7 +57,7 @@ $res = [
     "max_count" => 0
 ];
 
-// The main change is in the merchant selection query
+// Get all merchants that have OlaPay payment method (including those with both OlaPay and OlaPos)
 $olapay_merchants_query = "
     SELECT DISTINCT accounts.id
     FROM accounts
@@ -65,16 +65,7 @@ $olapay_merchants_query = "
     JOIN terminal_payment_methods ON terminal_payment_methods.terminal_id = terminals.id
     JOIN payment_methods ON payment_methods.id = terminal_payment_methods.payment_method_id
     WHERE payment_methods.code = 'olapay'
-    " . ($_REQUEST["type"] === 'agent' ? "AND accounts.accounts_id = :agent_id" : "") . "
-    AND accounts.id NOT IN (
-        SELECT DISTINCT accounts.id
-        FROM accounts
-        JOIN terminals ON terminals.vendors_id = accounts.id
-        JOIN terminal_payment_methods ON terminal_payment_methods.terminal_id = terminals.id
-        JOIN payment_methods ON payment_methods.id = terminal_payment_methods.payment_method_id
-        WHERE payment_methods.code = 'olapos'
-        " . ($_REQUEST["type"] === 'agent' ? "AND accounts.accounts_id = :agent_id" : "") . "
-    )";  // Exclude merchants that have olapos payment method
+    " . ($_REQUEST["type"] === 'agent' ? "AND accounts.accounts_id = :agent_id" : "") . "";
 
 $stmt_merchants = $pdo->prepare($olapay_merchants_query);
 $params_merchants = [];
