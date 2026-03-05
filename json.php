@@ -1178,10 +1178,13 @@ for ($i = 0; $i < count($payments); $i++) {
     }
     $order_row = $order_stmt->fetch();
     if ($order_row === false) {
-      // Order not found by UUID - try fallback lookup with terminals_id
-      $fallback_stmt = $pdo->prepare("select id from orders where uuid = ? and terminals_id = ?");
-      $fallback_stmt->execute([$order_uuid, $terminals_id]);
-      $order_row = $fallback_stmt->fetch();
+      // Order not found by UUID - try fallback lookup by orderId + terminals_id
+      $orderId_val = $payments[$i]->{"orderID"} ?? null;
+      if ($orderId_val !== null) {
+        $fallback_stmt = $pdo->prepare("select id from orders where orderId = ? and terminals_id = ? order by id desc limit 1");
+        $fallback_stmt->execute([$orderId_val, $terminals_id]);
+        $order_row = $fallback_stmt->fetch();
+      }
     }
     if ($order_row === false) {
       error_log("[JSON-PAYMENT] WARNING: Order not found for payment UUID: " . ($order_uuid ?? "NULL") . " paymentUuid: " . ($payments[$i]->{"paymentUuid"} ?? $payments[$i]->{"pUUID"} ?? "NULL") . " - skipping payment insert");
