@@ -1177,6 +1177,16 @@ for ($i = 0; $i < count($payments); $i++) {
       $order_uuid = $payments[$i]->{"oUUID"} ?? null;
     }
     $order_row = $order_stmt->fetch();
+    if ($order_row === false) {
+      // Order not found by UUID - try fallback lookup with terminals_id
+      $fallback_stmt = $pdo->prepare("select id from orders where uuid = ? and terminals_id = ?");
+      $fallback_stmt->execute([$order_uuid, $terminals_id]);
+      $order_row = $fallback_stmt->fetch();
+    }
+    if ($order_row === false) {
+      error_log("[JSON-PAYMENT] WARNING: Order not found for payment UUID: " . ($order_uuid ?? "NULL") . " paymentUuid: " . ($payments[$i]->{"paymentUuid"} ?? $payments[$i]->{"pUUID"} ?? "NULL") . " - skipping payment insert");
+      continue; // Skip this payment to avoid silent INSERT failure
+    }
     $orderRef = $order_row["id"];
   } else {
     print("Process payment - 2nd part - hasInventory: false" . " \n");
@@ -1203,8 +1213,18 @@ for ($i = 0; $i < count($payments); $i++) {
         print("existing order found with id: " . $existing_order["id"] . " \n");
         $orderRef = $existing_order["id"];
       }else{
-        print("existing order not found" . " \n");
-        $orderRef = null;
+        // Fallback: try without terminals_id filter (order might have been created by a different terminal)
+        $fallback_order_stmt = $pdo->prepare("select id from orders where uuid = ? order by id desc limit 1");
+        $fallback_order_stmt->execute([$order_uuid]);
+        $fallback_order_row = $fallback_order_stmt->fetch();
+        if ($fallback_order_row) {
+          print("existing order found via fallback (without terminals_id) with id: " . $fallback_order_row["id"] . " \n");
+          $orderRef = $fallback_order_row["id"];
+        } else {
+          error_log("[JSON-PAYMENT] WARNING: Order not found for UUID: " . $order_uuid . " terminals_id: " . $terminals_id . " - skipping payment insert");
+          print("existing order not found, skipping payment" . " \n");
+          continue; // Skip this payment to avoid silent INSERT failure with null orderReference
+        }
       }
     }else{
       // old build of the pos
@@ -1306,6 +1326,11 @@ for ($i = 0; $i < count($payments); $i++) {
     }
     continue;
   } else {
+    // Safety check: ensure orderRef is valid before INSERT (prevents silent failure on NOT NULL column)
+    if ($orderRef === null || $orderRef === false) {
+      error_log("[JSON-PAYMENT] CRITICAL: orderRef is null/false before INSERT - orderUuid: " . ($order_uuid ?? "NULL") . " paymentUuid: " . ($payment_uuid ?? "NULL") . " orderId: " . ($orderId ?? "NULL"));
+      continue;
+    }
     print_r("Payment does not exist for orderUuid: " . $order_uuid . " and paymentUuid: " . $payment_uuid . " \n");
     $originalTotal = $payments[$i]->{"orgTotal"} ?? null;
     $editTerminalSerial = $payments[$i]->{"editTermSerial"} ?? null;
