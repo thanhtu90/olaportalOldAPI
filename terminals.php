@@ -66,6 +66,9 @@ $stmt = $pdo->prepare("
         t.description,
         t.enterdate,
         t.store_uuid,
+        t.blocked,
+        t.blocked_at,
+        t.blocked_reason,
         JSON_ARRAYAGG(
             JSON_OBJECT(
                 'id', pm.id,
@@ -101,6 +104,9 @@ while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
         "description" => $row["description"],
         "enterdate" => $row["enterdate"],
         "store_uuid" => $row["store_uuid"],
+        "blocked" => (bool) $row["blocked"],
+        "blocked_at" => $row["blocked_at"],
+        "blocked_reason" => $row["blocked_reason"],
         "payment_methods" => $methods
     ];
 }
