@@ -271,7 +271,9 @@ function buildAllOrdersJson($pdo, $vendors_id, $startTime,$endTime){
             $tips = 0.0;
 
             // start the new order here
-            $orderDate = date("Y-m-d", $row["OrderDate"]);
+            $orderDate = !empty($row["OrderDate"])
+                ? date("Y-m-d", strtotime($row["OrderDate"]))
+                : date("Y-m-d");
 
             // start new payment here
             $paymentId = $row["payment_id"];
@@ -457,8 +459,18 @@ foreach ($payloadArray as $payload) {
     ]);
 }
 
+// Drain the queue to QuickBooks synchronously so a single `quickbook.php`
+// call both builds the batches and pushes them to QBO. Previously this file
+// only enqueued, which left rows stuck in `quickbooks_export_queue` until
+// `qb_export.php` was called separately — the reason merchants saw no sales
+// in QBO even after a 200 response here.
+include_once './library/qb_export_lib.php';
+$exportResult = flushQuickbooksQueue($pdo, (int)$vendors_id, $config);
+error_log('QB export summary: ' . json_encode($exportResult));
+
 echo json_encode([
-    'status' => 'success',
-    'batch_count' => count($payloadArray)
+    'status'      => 'success',
+    'batch_count' => count($payloadArray),
+    'qb_export'   => $exportResult,
 ]);
 ?>
