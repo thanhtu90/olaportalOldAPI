@@ -24,411 +24,316 @@ $vendors_id = $_REQUEST["id"];
 $startTime = strtotime($_REQUEST["fromDate"]);
 $endTime = strtotime($_REQUEST["toDate"]) + 86400;
 
+// Optional browser-supplied IANA timezone (e.g. "America/Chicago"). The
+// portal sends this with getQuickBook() so the export memo formats
+// `orders.lastMod` in the SAME zone the bookkeeper is viewing in the
+// portal sidenav. Validated in buildAllOrdersJson() before use.
+$requestTz = isset($_REQUEST["tz"]) ? (string)$_REQUEST["tz"] : '';
+
 error_log(print_r($vendors_id,true));
 
 error_log(print_r($startTime,true));
 
 error_log(print_r($endTime,true));
 
-function buildAllOrdersJson($pdo, $vendors_id, $startTime,$endTime){
-    $batchArray = [];
+// Build one QuickBooks SalesItemLine. Amount/UnitPrice are rounded to 2dp so
+// the receipt total in QBO matches the $X.XX subtotals shown in the portal.
+function qb_build_line($description, $amount, $qty = 1, $taxable = false) {
+    $amt = round((float)$amount, 2);
+    $qty = max(1, (int)$qty);
+    $unit = round($amt / $qty, 2);
+    return [
+        'Description' => (string)$description,
+        'Amount'      => $amt,
+        'DetailType'  => 'SalesItemLineDetail',
+        'SalesItemLineDetail' => [
+            'UnitPrice'  => $unit,
+            'Qty'        => $qty,
+            'TaxCodeRef' => ['value' => $taxable ? 'TAX' : 'NON'],
+        ],
+    ];
+}
 
-    $stmt_orders = $pdo -> prepare("
-        SELECT
-            o.OrderDate,
-            o.uuid,
-            o.orderReference,
-            o.total,
-            oi.id AS item_id,
-            oi.orderUuid AS item_ouuid,
-            oi.taxable AS item_taxable,
-            oi.description AS item_description,
-            oi.price AS item_price,
-            oi.qty AS item_qty,
-            omi.id AS mod_id,
-            omi.items_id AS oi_id,
-            omi.taxable AS mod_taxable,
-            omi.description AS mod_description,
-            omi.price AS mod_price,
-            p.id AS payment_id,
-            p.orderUuid AS payment_ouuid,
-            p.techFee,
-            p.tips
-        FROM orders o
-        LEFT JOIN orderItems oi ON o.uuid = oi.orderUuid
-        LEFT JOIN orderItems omi ON oi.id = omi.items_id
-        LEFT JOIN ordersPayments p ON o.uuid = p.orderUuid
-        WHERE o.lastMod >= :startTime
-        AND o.lastMod < :endTime
-        AND o.vendors_id = :vendors_id
-        ORDER BY o.lastMod DESC, oi.id
+// Build the QuickBooks SalesReceipt batch array for all orders in the window.
+//
+// Historically this ran a single cross-joined query over orders +
+// orderItems (parent) + orderItems (modifier) + ordersPayments. That caused
+// two distinct bugs:
+//   1. Modifier rows were ALSO returned as their own `oi` parent rows because
+//      `oi` was not filtered to `items_id = 0`, so every modifier shipped
+//      twice: once merged into the parent line ("Brewed Coffee; L") and once
+//      as a standalone line ("L  $0.50").
+//   2. The payment cross-join inflated tech-fee/tip sums when an order had
+//      multiple items or multiple payments.
+// The payload now matches the transaction-detail sidenav (one parent line
+// per item at its BASE price, plus one line per modifier at the modifier's
+// own price) and sends primary tax via TxnTaxDetail with secondary taxes as
+// additional line items. See CLAUDE.md for format decisions.
+function buildAllOrdersJson($pdo, $vendors_id, $startTime, $endTime, $requestTz = '') {
+    // Pick the timezone used to format `orders.lastMod` (UTC unix epoch)
+    // in the export memo. Priority:
+    //   1. Browser tz from the portal request (`?tz=...`) — matches exactly
+    //      what the bookkeeper sees in the sidenav.
+    //   2. `stores.timezone` for the vendor — best guess when the portal
+    //      client didn't send one (e.g. legacy cron/manual hits).
+    //   3. PHP default (America/Los_Angeles per README).
+    // Without this layering the memo drifts whenever the bookkeeper views
+    // the portal from outside the store's local timezone — which was the
+    // "02:13 PM portal vs 12:13 PM QB" bug.
+    $tzObj   = null;
+    $pickedTz = '';
+
+    if ($requestTz !== '') {
+        try {
+            $tzObj    = new DateTimeZone($requestTz);
+            $pickedTz = $requestTz;
+        } catch (Exception $e) {
+            error_log('QB export: invalid request timezone "' . $requestTz . '", falling through to stores.timezone');
+        }
+    }
+
+    if ($tzObj === null) {
+        $stmt_tz = $pdo->prepare("
+            SELECT timezone
+            FROM stores
+            WHERE vendor_id = :vendors_id
+              AND timezone IS NOT NULL
+              AND timezone <> ''
+            ORDER BY id ASC
+            LIMIT 1
+        ");
+        $stmt_tz->execute([':vendors_id' => $vendors_id]);
+        $storeTz = $stmt_tz->fetchColumn();
+        if ($storeTz) {
+            try {
+                $tzObj    = new DateTimeZone($storeTz);
+                $pickedTz = $storeTz;
+            } catch (Exception $e) {
+                error_log('QB export: invalid store timezone "' . $storeTz . '", falling through to PHP default');
+            }
+        }
+    }
+
+    if ($tzObj === null) {
+        $fallback = date_default_timezone_get() ?: 'America/Los_Angeles';
+        try {
+            $tzObj    = new DateTimeZone($fallback);
+            $pickedTz = $fallback;
+        } catch (Exception $e) {
+            $tzObj    = new DateTimeZone('America/Los_Angeles');
+            $pickedTz = 'America/Los_Angeles';
+        }
+    }
+    error_log('QB export: formatting timestamps in timezone ' . $pickedTz);
+
+    // Keep `lastMod` as a raw unix int and format it in PHP — that's the
+    // same timestamp the portal sidenav shows (the frontend does
+    // `new Date(lastMod * 1000)` which renders in browser-local time;
+    // bookkeepers reconcile against the store's local clock).
+    $stmt_orders = $pdo->prepare("
+        SELECT id, uuid, orderReference, lastMod,
+               subTotal, tax, total, secondary_tax_list
+        FROM orders
+        WHERE lastMod >= :startTime
+          AND lastMod < :endTime
+          AND vendors_id = :vendors_id
+        ORDER BY lastMod DESC
     ");
     $stmt_orders->execute([
-        ':startTime' => $startTime, 
-        ':endTime' => $endTime, 
-        ':vendors_id' => $vendors_id
+        ':startTime'  => $startTime,
+        ':endTime'    => $endTime,
+        ':vendors_id' => $vendors_id,
     ]);
 
-    $orderCount = 1;
+    // Parent items only — items_id = 0 is the flag for top-level order items
+    // (same convention used by orderDetail2.php for the portal sidenav).
+    $stmt_items = $pdo->prepare("
+        SELECT id, description, price, qty, taxable, discount
+        FROM orderItems
+        WHERE orderUuid = :uuid AND items_id = 0
+        ORDER BY id ASC
+    ");
 
-    $prevOrderUuid = null;
+    $stmt_mods = $pdo->prepare("
+        SELECT description, price, taxable
+        FROM orderItems
+        WHERE orderUuid = :uuid AND items_id = :parent_id
+        ORDER BY id ASC
+    ");
 
-    $prevItemId = null;
-    $itemNameWMod = null;
-    $itemPrice = 0.0;
+    // One row per order — prevents the cross-join inflation when an order
+    // has multiple items or multiple payment rows.
+    $stmt_pays = $pdo->prepare("
+        SELECT COALESCE(SUM(techFee), 0) AS totalTechFee,
+               COALESCE(SUM(tips),    0) AS totalTips
+        FROM ordersPayments
+        WHERE orderUuid = :uuid
+    ");
 
-    $prevPaymentId = null;
-    $techfee = 0.0;
-    $tips = 0.0;
-
-    $items = null;
-    $line = [];
-
-    $batch = null;
+    $batchArray       = [];
     $batchItemRequest = [];
-    $batchPackage = null;
+    $orderCount       = 0;
 
-    $lastOrderRef = null;
+    while ($order = $stmt_orders->fetch(PDO::FETCH_ASSOC)) {
+        $uuid = $order['uuid'];
+        if ($uuid === null || $uuid === '') {
+            continue;
+        }
 
-    while ( $row = $stmt_orders->fetch() ) {
-        $orderUUID = $row['uuid'];
-        $lastOrderRef = $row['orderReference'];
+        $line = [];
+        $lineDiscountTotal = 0.0;
 
-        error_log("Current Order UUID: " . (string)$orderUUID . "; Prev Order UUID: " . (string)$prevOrderUuid);
+        // ── Parent items + modifiers ────────────────────────────────────
+        $stmt_items->execute([':uuid' => $uuid]);
+        while ($item = $stmt_items->fetch(PDO::FETCH_ASSOC)) {
+            $itemQty     = max(1, (int)$item['qty']);
+            $itemPrice   = (float)$item['price'];
+            $itemTaxable = ((int)$item['taxable'] === 1);
 
-        if ($orderUUID === $prevOrderUuid){//Still processing same order, start to add items and payments
-            //add payments
-            $paymentId = $row["payment_id"];
+            // Parent line at BASE price × qty (modifiers are NOT rolled in).
+            $line[] = qb_build_line(
+                $item['description'],
+                $itemPrice * $itemQty,
+                $itemQty,
+                $itemTaxable
+            );
 
-            if ($paymentId !== $prevPaymentId && $paymentId !== null) {//New payment
-                if ($row["payment_ouuid"] === $orderUUID){
-                    if ($row["techFee"] !== null){
-                        $techfee = $techfee + (float)$row["techFee"];
-                    }
-                    if ($row["tips"] !== null){
-                        $tips = $tips + (float)$row["tips"];
-                    }
+            // Item-level discount (e.g. "Item Discount" shown in the sidenav).
+            $lineDiscountTotal += (float)$item['discount'] * $itemQty;
+
+            // One QB line per modifier, at the modifier's own price.
+            // Multiply by the PARENT qty so `sum(parent + mods)` still equals
+            // the order subTotal when qty > 1.
+            $stmt_mods->execute([':uuid' => $uuid, ':parent_id' => (int)$item['id']]);
+            while ($mod = $stmt_mods->fetch(PDO::FETCH_ASSOC)) {
+                $modPrice   = (float)$mod['price'];
+                $modTaxable = ((int)$mod['taxable'] === 1);
+                if (abs($modPrice) < 0.00001) {
+                    // Skip zero-priced modifiers (e.g. "Small" sizing with no
+                    // upcharge). They'd show as "$0.00 S" rows in QBO which
+                    // the user explicitly flagged as noise.
+                    continue;
                 }
-            }
-
-            $prevPaymentId = $paymentId;
-
-            //add items
-            $itemId = $row["item_id"];
-            $taxable = 'NON';
-            if ($itemId === $prevItemId && $itemId !== null){//Still processing same order item, add modifier
-                //Add modifier
-                if ($row['mod_price'] !== null){
-                    $itemPrice = $itemPrice + (float)$row['mod_price'];
-                    $itemNameWMod = $itemNameWMod . "; " . $row['mod_description'];
-                    if ($row['mod_taxable'] === 0){
-                        $taxable = 'NON';
-                    }
-
-                    $items['Description'] = $itemNameWMod;
-                    $items['Amount'] = $itemPrice * (int)$row['item_qty'];
-                    $items['SalesItemLineDetail']['UnitPrice'] = $itemPrice;
-                    $items['SalesItemLineDetail']['TaxCodeRef']['value'] = $taxable;
-                }
-            } else {//Moved to new item
-
-                // save finished items
-                if ($items !== null) {
-                    $line[] = $items;
-                }
-
-                // reset items
-                $items = null;
-
-                // start the new item here
-                $taxable = 'NON';
-                if ($row['item_taxable'] === 1) {
-                   $taxable = 'TAX';
-                }
-                $itemPrice = (float)$row['item_price'];
-                $itemNameWMod = $row['item_description'];
-
-                //Add modifier
-                if ($row['mod_price'] !== null){
-                    $itemPrice = $itemPrice + (float)$row['mod_price'];
-                    $itemNameWMod = $itemNameWMod . "; " . $row['mod_description'];
-                    if ($row['mod_taxable'] === 0){
-                        $taxable = 'NON';
-                    }
-                }
-
-                $items = [
-                    'LineNum' => 1,
-                    'Description' => $itemNameWMod,
-                    'Amount' => $itemPrice  * (int)$row['item_qty'],
-                    'DetailType' => "SalesItemLineDetail",
-                    'SalesItemLineDetail' => [
-                        'UnitPrice' => $itemPrice ,
-                        'Qty' => (int)$row['item_qty'],
-                        'TaxCodeRef' => [
-                            'value' => $taxable
-                        ]
-                    ]
-                ];
-            }
-            //Move on to next item
-            $prevItemId = $itemId;
-        } else {//Moved to new order, reset paramenters
-            if ($prevOrderUuid !== null){
-                // Save last item
-                if ($items !== null) {
-                    $line[] = $items;
-                }
-
-                // Add tips and tech fee as items
-                if ($techfee !== null && $techfee > 0.0) {
-                    $tf_items = [
-                        'LineNum' => 1,
-                        'Description' => 'Tech Fee',
-                        'Amount' => $techfee,
-                        'DetailType' => "SalesItemLineDetail",
-                        'SalesItemLineDetail' => [
-                            'UnitPrice' => $techfee,
-                            'Qty' => 1,
-                            'TaxCodeRef' => [
-                                'value' => 'NON'
-                            ]
-                        ]
-                    ];
-                    $line[] = $tf_items;
-                }
-                if ($tips !== null && $tips > 0.0){
-                    $tips_items = [
-                        'LineNum' => 1,
-                        'Description' => 'Tips',
-                        'Amount' => $tips,
-                        'DetailType' => "SalesItemLineDetail",
-                        'SalesItemLineDetail' => [
-                            'UnitPrice' => $tips,
-                            'Qty' => 1,
-                            'TaxCodeRef' => [
-                                'value' => 'NON'
-                            ]
-                        ]
-                    ];
-                    $line[] = $tips_items;
-                }
-
-                //Save current order
-                error_log("Order Count: " . (string)$orderCount);
-                if ($orderCount <= 30) {
-                    //Create new batch items
-                    //error_log('Line to add to batch: ' . print_r($line,true));
-                    $batch = [
-                        'bId' => "bid" . (string)$orderCount,
-                        'operation' => "create",
-                        'SalesReceipt' => [
-                            'TxnDate' => $orderDate,
-                            'DocNumber' => (string)$row['orderReference'],
-                            'Line' => $line
-                        ]
-                    ];
-                    //Save into current batch item array 
-                    $batchItemRequest[] = $batch;
-                    $orderCount = $orderCount + 1;
-                } else {
-                    //Reset order count
-                    $orderCount = 1;
-                    //Create a sendable batch json
-                    $batchPackage = [
-                        'BatchItemRequest' => $batchItemRequest
-                    ];
-                    error_log('Order Batch Package: ' . print_r(json_encode($batchPackage), true));
-                    //Add batch json into array
-                    $batchArray[] = $batchPackage;
-                    //Reset batch item array
-                    $batchItemRequest = [];
-                    //Add current order (batch item) into the resetted batch item array, prevent skipping the current order
-                    $batch = [
-                        'bId' => "bid" . (string)$orderCount,
-                        'operation' => "create",
-                        'SalesReceipt' => [
-                            'TxnDate' => $orderDate,
-                            'Line' => $line
-                        ]
-                    ];
-                    $batchItemRequest[] = $batch;
-                    $orderCount = $orderCount + 1;
-                }
-            }
-
-            //Reset order
-            $prevOrderUuid = null;
-
-            $line = [];
-            $items = null;
-            $prevItemId = null;
-            $itemNameWMod = null;
-            $itemPrice = 0.0;
-
-            $prevPaymentId = null;
-            $techfee = 0.0;
-            $tips = 0.0;
-
-            // start the new order here
-            $orderDate = !empty($row["OrderDate"])
-                ? date("Y-m-d", strtotime($row["OrderDate"]))
-                : date("Y-m-d");
-
-            // start new payment here
-            $paymentId = $row["payment_id"];
-            if ($paymentId !== $prevPaymentId && $paymentId !== null) {//New payment
-                if ($row["payment_ouuid"] === $orderUUID){
-                    if ($row["techFee"] !== null){
-                        $techfee = $techfee + (float)$row["techFee"];
-                    }
-                    if ($row["tips"] !== null){
-                        $tips = $tips + (float)$row["tips"];
-                    }
-                }
-            }
-
-            $prevPaymentId = $paymentId;
-
-            // start the new item here
-            if ($row['item_id'] !== null){
-                $itemId = $row["item_id"];
-                $taxable = 'NON';
-                if ($row['item_taxable'] === 1) {
-                   $taxable = 'TAX';
-                }
-                $itemPrice = (float)$row['item_price'];
-                $itemNameWMod = $row['item_description'];
-
-                //Add modifier
-                if ($row['mod_price'] !== null){
-                    $itemPrice = $itemPrice + (float)$row['mod_price'];
-                    $itemNameWMod = $itemNameWMod . "; " . $row['mod_description'];
-                    if ($row['mod_taxable'] === 0){
-                        $taxable = 'NON';
-                    }
-                }
-
-                $items = [
-                    'LineNum' => 1,
-                    'Description' => $itemNameWMod,
-                    'Amount' => $itemPrice  * (int)$row['item_qty'],
-                    'DetailType' => "SalesItemLineDetail",
-                    'SalesItemLineDetail' => [
-                        'UnitPrice' => $itemPrice ,
-                        'Qty' => (int)$row['item_qty'],
-                        'TaxCodeRef' => [
-                            'value' => $taxable
-                        ]
-                    ]
-                ];
-                //Move on to next item
-                $prevItemId = $itemId;
+                $line[] = qb_build_line(
+                    $mod['description'],
+                    $modPrice * $itemQty,
+                    1,
+                    $modTaxable
+                );
             }
         }
-        $prevOrderUuid = $orderUUID;
-    }
-    //Process last item
-    error_log("Last Item: " . print_r($items,true));
-    // save finished items
-    if ($items !== null) {
-        $line[] = $items;
-    }
-    // Add tips and tech fee as items
-    if ($techfee !== null && $techfee > 0.0) {
-        $tf_items = [
-            'LineNum' => 1,
-            'Description' => 'Tech Fee',
-            'Amount' => $techfee,
-            'DetailType' => "SalesItemLineDetail",
-            'SalesItemLineDetail' => [
-                'UnitPrice' => $techfee,
-                'Qty' => 1,
-                'TaxCodeRef' => [
-                    'value' => 'NON'
-                ]
-            ]
-        ];
-        $line[] = $tf_items;
-    }
-    if ($tips !== null && $tips > 0.0){
-        $tips_items = [
-            'LineNum' => 1,
-            'Description' => 'Tips',
-            'Amount' => $tips,
-            'DetailType' => "SalesItemLineDetail",
-            'SalesItemLineDetail' => [
-                'UnitPrice' => $tips,
-                'Qty' => 1,
-                'TaxCodeRef' => [
-                    'value' => 'NON'
-                ]
-            ]
-        ];
-        $line[] = $tips_items;
-    }
 
-    //Save current order
-    error_log("Order Count Last: " . (string)$orderCount);
-    if ($orderCount <= 30) {
-        //Create new batch items
-        if ($lastOrderRef === null || $lastOrderRef === ''){
-            error_log("Empty order reference: " . (string)$orderCount);
+        // ── Discount (order-level, negative line) ───────────────────────
+        if ($lineDiscountTotal > 0.00001) {
+            $discLine = qb_build_line('Discount', -$lineDiscountTotal, 1, false);
+            // qb_build_line clamps qty >= 1 but UnitPrice must stay negative.
+            $discLine['SalesItemLineDetail']['UnitPrice'] = round(-$lineDiscountTotal, 2);
+            $line[] = $discLine;
         }
-        $batch = [
-            'bId' => "bid" . (string)$orderCount,
-            'operation' => "create",
-            'SalesReceipt' => [
-                'TxnDate' => $orderDate,
-                'DocNumber' => (string)$lastOrderRef,
-                'Line' => $line
-            ]
+
+        // ── Secondary taxes as additional plain line items ──────────────
+        // secondary_tax_list is stored as a JSON object like
+        //   {"0":{"name":"CRV","taxTotalAmount":0.25}, ...}
+        // Each non-zero entry becomes its own NON-tax service line so the
+        // QBO receipt total picks them up (TxnTaxDetail below only covers
+        // the primary tax).
+        if (!empty($order['secondary_tax_list'])) {
+            $parsed = json_decode($order['secondary_tax_list'], true);
+            if (is_array($parsed)) {
+                foreach ($parsed as $t) {
+                    if (!is_array($t)) {
+                        continue;
+                    }
+                    $amt = isset($t['taxTotalAmount']) ? (float)$t['taxTotalAmount'] : 0.0;
+                    if ($amt <= 0.00001) {
+                        continue;
+                    }
+                    $name = isset($t['name']) && $t['name'] !== '' ? (string)$t['name'] : 'Secondary Tax';
+                    $line[] = qb_build_line($name, $amt, 1, false);
+                }
+            }
+        }
+
+        // ── Primary tax as a plain line item ────────────────────────────
+        // Why a line item instead of TxnTaxDetail.TotalTax: QBO Automated
+        // Sales Tax (AST) silently ignores TotalTax unless a valid
+        // TxnTaxCodeRef is also supplied, and we don't map vendor tax codes
+        // here. A NON-tax line item works on both AST and manual-tax
+        // accounts and guarantees the receipt total absorbs the tax (this
+        // is the same pattern we use for Tech Fee / Tips / secondary tax).
+        $primaryTax = (float)$order['tax'];
+        if ($primaryTax > 0.00001) {
+            $line[] = qb_build_line('Tax', $primaryTax, 1, false);
+        }
+
+        // ── Tech fee + tips (summed per order, not per joined row) ──────
+        $stmt_pays->execute([':uuid' => $uuid]);
+        $payRow  = $stmt_pays->fetch(PDO::FETCH_ASSOC) ?: [];
+        $techFee = (float)($payRow['totalTechFee'] ?? 0);
+        $tipsAmt = (float)($payRow['totalTips']    ?? 0);
+
+        if ($techFee > 0.00001) {
+            $line[] = qb_build_line('Tech Fee', $techFee, 1, false);
+        }
+        if ($tipsAmt > 0.00001) {
+            $line[] = qb_build_line('Tips', $tipsAmt, 1, false);
+        }
+
+        // ── Date + private note ─────────────────────────────────────────
+        // QBO SalesReceipt.TxnDate is date-only. Stash the full datetime
+        // and the portal's full order reference in PrivateNote so
+        // bookkeepers can reconcile QBO entries against the portal
+        // (matches the "Ref #<id> / <orderReference>" shown in the
+        // order-detail sidenav).
+        $lastModTs = (int)$order['lastMod'];
+        if ($lastModTs > 0) {
+            $dt = (new DateTime('@' . $lastModTs))->setTimezone($tzObj);
+            $orderDate     = $dt->format('Y-m-d');
+            $orderDateTime = $dt->format('Y-m-d h:i A');
+        } else {
+            $orderDate     = date('Y-m-d');
+            $orderDateTime = '';
+        }
+
+        $fullRef = '#' . (string)$order['id'] . ' / ' . (string)$order['orderReference'];
+
+        $noteParts = [];
+        if ($orderDateTime !== '') {
+            $noteParts[] = 'Order time: ' . $orderDateTime;
+        }
+        $noteParts[] = 'Order reference: ' . $fullRef;
+
+        $salesReceipt = [
+            'TxnDate'     => $orderDate,
+            'DocNumber'   => (string)$order['orderReference'],
+            'PrivateNote' => implode(' | ', $noteParts),
+            'Line'        => $line,
         ];
-        //Save into current batch item array 
-        $batchItemRequest[] = $batch;
-        
-        //Create a sendable batch json
-        $batchPackage = [
-            'BatchItemRequest' => $batchItemRequest
+
+        // ── Batch (30 receipts max per QBO batch request) ───────────────
+        $orderCount++;
+        $batchItemRequest[] = [
+            'bId'          => 'bid' . (string)$orderCount,
+            'operation'    => 'create',
+            'SalesReceipt' => $salesReceipt,
         ];
-        error_log('Order Batch Package Last: ' . print_r(json_encode($batchPackage), true));
-        //Add batch json into array
-        $batchArray[] = $batchPackage;
-    } else {
-        //Reset order count
-        $orderCount = 1;
-        //Create a sendable batch json
-        $batchPackage = [
-            'BatchItemRequest' => $batchItemRequest
-        ];
-        error_log('Order Batch Package: ' . print_r(json_encode($batchPackage), true));
-        //Add batch json into array
-        $batchArray[] = $batchPackage;
-        //Reset batch item array
-        $batchItemRequest = [];
-        //Add current order (batch item) into the resetted batch item array, prevent skipping the current order
-        $batch = [
-            'bId' => "bid" . (string)$orderCount,
-            'operation' => "create",
-            'SalesReceipt' => [
-                'TxnDate' => $orderDate,
-                'Line' => $line
-            ]
-        ];
-        $batchItemRequest[] = $batch;
-        //Create a sendable batch json
-        $batchPackage = [
-            'BatchItemRequest' => $batchItemRequest
-        ];
-        error_log('Order Batch Package: ' . print_r(json_encode($batchPackage), true));
-        //Add batch json into array
-        $batchArray[] = $batchPackage;
+
+        if ($orderCount >= 30) {
+            $batchArray[]     = ['BatchItemRequest' => $batchItemRequest];
+            $batchItemRequest = [];
+            $orderCount       = 0;
+        }
     }
 
+    if (!empty($batchItemRequest)) {
+        $batchArray[] = ['BatchItemRequest' => $batchItemRequest];
+    }
+
+    error_log('QB batch count: ' . count($batchArray));
     return $batchArray;
 }
 
-$payloadArray = buildAllOrdersJson($pdo,$vendors_id,$startTime,$endTime);
+$payloadArray = buildAllOrdersJson($pdo,$vendors_id,$startTime,$endTime,$requestTz);
 
 $batchCount = count($payloadArray);
 

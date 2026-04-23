@@ -504,7 +504,7 @@ function processOrderItemsForOrder($pdo, $items_json, $orderReference, $order, $
  * @param array $orderData Order data for update (online/POS existing order)
  * @return bool True if order exists and should be skipped, false otherwise
  */
-function checkAndHandleExistingOrder($pdo, $stmt, $isOnlinePlatform, $orderReference, $onlineorder_id, $terminals_id, $vendors_id, &$orderRefMap, $orderData = null) {
+function checkAndHandleExistingOrder($pdo, $stmt, $isOnlinePlatform, $orderReference, $onlineorder_id, $terminals_id, $vendors_id, &$orderRefMap, $orderData = null, $order_uuid = null) {
     if ($stmt->rowCount() != 0) {
         if ($isOnlinePlatform == true) {
             print("order - onlineorder_id: " . $onlineorder_id . " isOnlinePlatform: true - has existing order" . " \n");
@@ -516,9 +516,19 @@ function checkAndHandleExistingOrder($pdo, $stmt, $isOnlinePlatform, $orderRefer
         fputs($fp, time() . " 資料庫中仍有相同lastMod的資料 跳過\n");
         fclose($fp);
         
-        // Add existing order to map for payment processing
-        $existing_order_stmt = $pdo->prepare("SELECT id, lastMod FROM orders WHERE vendors_id = ? AND terminals_id = ? AND orderReference = ? ORDER BY id DESC LIMIT 1");
-        $existing_order_stmt->execute([$vendors_id, $terminals_id, $orderReference]);
+        // Add existing order to map for payment processing.
+        // When we have a business UUID, match by (vendors_id, uuid) so we find
+        // the canonical row regardless of which terminal created it. Pick the
+        // oldest row (ASC) so every forwarding terminal converges on the same
+        // canonical orders.id. Fall back to the legacy per-terminal lookup for
+        // payloads without an oUUID and for online-platform orders.
+        if ($isOnlinePlatform == false && !empty($order_uuid)) {
+            $existing_order_stmt = $pdo->prepare("SELECT id, lastMod FROM orders WHERE vendors_id = ? AND uuid = ? ORDER BY id ASC LIMIT 1");
+            $existing_order_stmt->execute([$vendors_id, $order_uuid]);
+        } else {
+            $existing_order_stmt = $pdo->prepare("SELECT id, lastMod FROM orders WHERE vendors_id = ? AND terminals_id = ? AND orderReference = ? ORDER BY id DESC LIMIT 1");
+            $existing_order_stmt->execute([$vendors_id, $terminals_id, $orderReference]);
+        }
         $existing_order = null;
         if ($existing_order_stmt->rowCount() > 0) {
             $existing_order = $existing_order_stmt->fetch();
@@ -1000,8 +1010,18 @@ for ($i = 0; $i < count($orders_json); $i++) {
   #$stmt = $pdo->prepare("select * from orders where terminals_id = ? and lastMod = ?");
   #$stmt->execute([ $terminals_id, $lastMod ]);
   if ($isOnlinePlatform == false) {
-    $stmt = $pdo->prepare("select * from orders where terminals_id = ? and orderDate = ? and orderReference = ?");
-    $stmt->execute([$terminals_id, $orderDate, $orderReference]);
+    // Primary dedupe key is the business UUID (oUUID). The legacy per-terminal
+    // key (terminals_id + orderDate + orderReference) caused duplicate `orders`
+    // rows whenever the same logical order was forwarded by a second terminal
+    // (different terminals_id / different local orderReference).
+    if (!empty($order_uuid)) {
+      $stmt = $pdo->prepare("select * from orders where vendors_id = ? and uuid = ?");
+      $stmt->execute([$vendors_id, $order_uuid]);
+    } else {
+      // Legacy payloads without oUUID fall back to the old per-terminal probe.
+      $stmt = $pdo->prepare("select * from orders where terminals_id = ? and orderDate = ? and orderReference = ?");
+      $stmt->execute([$terminals_id, $orderDate, $orderReference]);
+    }
   } else {
     $online_platform_order_uuid = $orders_json[$i]->{"uuid"};
     $stmt = $pdo->prepare("select * from orders where terminals_id = ? and onlineorder_id = ?");
@@ -1034,7 +1054,7 @@ for ($i = 0; $i < count($orders_json); $i++) {
   ];
   
   // Check if order exists and handle accordingly
-  if (checkAndHandleExistingOrder($pdo, $stmt, $isOnlinePlatform, $orderReference, $onlineorder_id, $terminals_id, $vendors_id, $orderRefMap, $orderData)) {
+  if (checkAndHandleExistingOrder($pdo, $stmt, $isOnlinePlatform, $orderReference, $onlineorder_id, $terminals_id, $vendors_id, $orderRefMap, $orderData, $order_uuid)) {
     // Check if this json has items and match orderReference, if there is any, upsert the order items
     if (isset($orderRefMap[strval($orderReference)])) {
       $existing_order_stmt = $pdo->prepare("SELECT * FROM orders WHERE id = ? AND vendors_id = ? AND terminals_id = ?");
