@@ -68,7 +68,8 @@ SELECT
     o.onlinetrans_id,
     o.uuid,
     o.store_uuid,
-    o.secondary_tax_list
+    o.secondary_tax_list,
+    o.order_type
 FROM orders o
 WHERE o.lastMod > ? AND o.lastMod < ? $where
 ORDER BY o.uuid, o.lastMod DESC
@@ -382,6 +383,8 @@ try {
         $entry["delivery_type"] = $order["delivery_type"];
         $entry["onlineorder_id"] = $order["onlineorder_id"];
         $entry["onlinetrans_id"] = $order["onlinetrans_id"];
+        // Align with Go Orders2 / portal: invoice rows use order_type = INVOICE in DB
+        $entry["order_type"] = isset($order["order_type"]) ? $order["order_type"] : null;
         $entry["uuid"] = $order["uuid"];
         $entry["store_uuid"] = $order["store_uuid"];
         $entry["orderReference"] = $order["orderReference"];
